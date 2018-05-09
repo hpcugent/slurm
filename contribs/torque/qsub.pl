@@ -163,8 +163,11 @@ sub make_command
         $help,
         $resp,
         $man,
-        @pass
+        @pass,
+        @script_args
         );
+
+    @script_args = (@ARGV);
 
     GetOptions(
         'a=s'      => \$start_time,
@@ -224,7 +227,7 @@ sub make_command
     }
 
     # Use sole remaining argument as jobIds
-    my ($script, @script_args, $script_cmd, $defaults);
+    my ($script, $script_cmd, $defaults);
     my $mode = 0;
 
     $mode |= DRYRUN if $dryrun;
@@ -232,7 +235,6 @@ sub make_command
     if ($ARGV[0]) {
         $script = shift(@ARGV);
         $defaults->{J} = basename($script) if ! $job_name;
-        @script_args = (@ARGV);
         $script_cmd = join(" ", $script, @script_args);
     } else {
         $defaults->{J} = "sbatch" if ! $job_name;
