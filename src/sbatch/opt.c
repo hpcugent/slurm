@@ -2271,13 +2271,14 @@ static void _set_pbs_options(int argc, char **argv)
 {
 	int opt_char, option_index = 0;
 	char *sep = "";
-	char *pbs_opt_string = "+a:A:c:C:e:hIj:J:k:l:m:M:N:o:p:q:r:S:t:u:v:VW:z";
+	char *pbs_opt_string = "+a:A:c:C:d:e:hIj:J:k:l:m:M:N:o:p:q:r:S:t:u:v:VW:z";
 
 	struct option pbs_long_options[] = {
 		{"start_time", required_argument, 0, 'a'},
 		{"account", required_argument, 0, 'A'},
 		{"checkpoint", required_argument, 0, 'c'},
 		{"working_dir", required_argument, 0, 'C'},
+		{"working_dir", required_argument, 0, 'd'},
 		{"error", required_argument, 0, 'e'},
 		{"hold", no_argument, 0, 'h'},
 		{"interactive", no_argument, 0, 'I'},
@@ -2317,6 +2318,13 @@ static void _set_pbs_options(int argc, char **argv)
 		case 'c':
 			break;
 		case 'C':
+			break;
+		case 'd':
+			xfree(opt.cwd);
+			if (is_full_path(optarg))
+				opt.cwd = xstrdup(optarg);
+			else
+				opt.cwd = make_full_path(optarg);
 			break;
 		case 'e':
 			xfree(sbopt.efname);
