@@ -1,6 +1,6 @@
 Name:		slurm
 Version:	17.11.8
-%global rel	2
+%global rel	3
 Release:	%{rel}%{gittag}%{?dist}.ug
 Summary:	Slurm Workload Manager
 
