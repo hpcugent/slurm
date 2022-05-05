@@ -179,7 +179,7 @@ static int _check_hash(buf_t *buffer, header_t *header, slurm_msg_t *msg,
 	char *cred_hash = NULL;
 	uint32_t cred_hash_len = 0;
 	int rc;
-	static time_t config_update = 0;
+	static time_t config_update = (time_t) -1;
 	static bool block_null_hash = true;
 
 	if (config_update != slurm_conf.last_update) {
@@ -1118,6 +1118,8 @@ int slurm_receive_msg(int fd, slurm_msg_t *msg, int timeout)
 	 */
 	if (slurm_msg_recvfrom_timeout(fd, &buf, &buflen, 0, timeout) < 0) {
 		rc = errno;
+		if (!rc)
+			rc = SLURMCTLD_COMMUNICATIONS_RECEIVE_ERROR;
 		goto endit;
 	}
 
@@ -1813,13 +1815,14 @@ int slurm_send_node_msg(int fd, slurm_msg_t * msg)
 	 * Pack auth credential
 	 */
 	rc = g_slurm_auth_pack(auth_cred, buffer, header.version);
-	(void) g_slurm_auth_destroy(auth_cred);
 	if (rc) {
 		error("%s: g_slurm_auth_pack: %s has  authentication error: %m",
 		      __func__, rpc_num2string(header.msg_type));
+		(void) g_slurm_auth_destroy(auth_cred);
 		free_buf(buffer);
 		slurm_seterrno_ret(SLURM_PROTOCOL_AUTHENTICATION_ERROR);
 	}
+	(void) g_slurm_auth_destroy(auth_cred);
 
 	/*
 	 * Pack message into buffer
@@ -2045,8 +2048,24 @@ static void _resp_msg_setup(slurm_msg_t *msg, slurm_msg_t *resp_msg,
 	resp_msg->protocol_version = msg->protocol_version;
 	resp_msg->ret_list = msg->ret_list;
 	resp_msg->orig_addr = msg->orig_addr;
-	if (msg->auth_uid_set)
+	/*
+	 * Extra sanity check. This should always be set. But if for some
+	 * reason it isn't, restrict the decode to avoid leaking an
+	 * unrestricted authentication token.
+	 *
+	 * Implicitly trust communications initiated by SlurmUser and
+	 * SlurmdUser. In future releases this won't matter - there's
+	 * no point packing an auth token on the reply as it isn't checked,
+	 * but we're stuck doing that on older protocol versions for
+	 * backwards-compatibility.
+	 */
+	if (!msg->auth_uid_set)
+		slurm_msg_set_r_uid(resp_msg, SLURM_AUTH_NOBODY);
+	else if ((msg->auth_uid != slurm_conf.slurm_user_id) &&
+		 (msg->auth_uid != slurm_conf.slurmd_user_id))
 		slurm_msg_set_r_uid(resp_msg, msg->auth_uid);
+	else
+		slurm_msg_set_r_uid(resp_msg, SLURM_AUTH_UID_ANY);
 }
 
 static void _rc_msg_setup(slurm_msg_t *msg, slurm_msg_t *resp_msg,

@@ -4595,6 +4595,7 @@ extern job_record_t *job_array_split(job_record_t *job_ptr)
 	}
 	job_ptr_pend->array_task_id = NO_VAL;
 
+	job_ptr_pend->batch_features = xstrdup(job_ptr->batch_features);
 	job_ptr_pend->batch_host = NULL;
 	job_ptr_pend->burst_buffer = xstrdup(job_ptr->burst_buffer);
 	job_ptr_pend->burst_buffer_state = xstrdup(job_ptr->burst_buffer_state);
@@ -4634,6 +4635,7 @@ extern job_record_t *job_array_split(job_record_t *job_ptr)
 	job_ptr_pend->node_bitmap_cg = NULL;
 	job_ptr_pend->nodes = NULL;
 	job_ptr_pend->nodes_completing = NULL;
+	job_ptr_pend->origin_cluster = xstrdup(job_ptr->origin_cluster);
 	job_ptr_pend->partition = xstrdup(job_ptr->partition);
 	job_ptr_pend->part_ptr_list = part_list_copy(job_ptr->part_ptr_list);
 	/* On jobs that are held the priority_array isn't set up yet,
@@ -7228,7 +7230,7 @@ static int _job_create(job_desc_msg_t *job_desc, int allocate, int will_run,
 	job_desc->tres_req_cnt[TRES_ARRAY_MEM]  = job_get_tres_mem(NULL,
 					job_desc->pn_min_memory,
 					job_desc->tres_req_cnt[TRES_ARRAY_CPU],
-					job_desc->min_nodes);
+					job_desc->min_nodes, part_ptr);
 
 	license_list = license_validate(job_desc->licenses,
 					validate_cfgd_licenses, true,
@@ -8517,6 +8519,22 @@ static uint16_t _cpus_per_node_part(part_record_t *part_ptr)
 	return 0;
 }
 
+/* Return memory on the first node in the identified partition */
+static uint64_t _mem_per_node_part(part_record_t *part_ptr)
+{
+	int node_inx = -1;
+	node_record_t *node_ptr;
+
+	if (part_ptr->node_bitmap)
+		node_inx = bit_ffs(part_ptr->node_bitmap);
+	if (node_inx >= 0) {
+		node_ptr = node_record_table_ptr + node_inx;
+		return (node_ptr->config_ptr->real_memory -
+			node_ptr->mem_spec_limit);
+	}
+	return 0;
+}
+
 /*
  * Test if this job exceeds any of MaxMemPer[CPU|Node] limits and potentially
  * adjust mem / cpu ratios.
@@ -8573,6 +8591,9 @@ static bool _valid_pn_min_mem(job_desc_msg_t *job_desc_msg,
 		}
 		return true;
 	}
+
+	if (job_mem_limit == 0)
+		job_mem_limit = _mem_per_node_part(part_ptr);
 
 	if (((job_mem_limit & MEM_PER_CPU) == 0) &&
 	    ((sys_mem_limit & MEM_PER_CPU) == 0)) {
@@ -9142,7 +9163,8 @@ extern void job_set_req_tres(job_record_t *job_ptr, bool assoc_mgr_locked)
 	job_ptr->tres_req_cnt[TRES_ARRAY_MEM] = job_get_tres_mem(
 							job_ptr->job_resrcs,
 							mem_cnt, cpu_cnt,
-							node_cnt);
+							node_cnt,
+							job_ptr->part_ptr);
 
 	license_set_job_tres_cnt(job_ptr->license_list,
 				 job_ptr->tres_req_cnt,
@@ -9210,7 +9232,8 @@ extern void job_set_alloc_tres(job_record_t *job_ptr, bool assoc_mgr_locked)
 			job_ptr->job_resrcs,
 			job_ptr->details->pn_min_memory,
 			job_ptr->tres_alloc_cnt[TRES_ARRAY_CPU],
-			job_ptr->tres_alloc_cnt[TRES_ARRAY_NODE]);
+			job_ptr->tres_alloc_cnt[TRES_ARRAY_NODE],
+			job_ptr->part_ptr);
 
 	job_ptr->tres_alloc_cnt[TRES_ARRAY_ENERGY] = NO_VAL64;
 
@@ -12476,7 +12499,8 @@ static int _update_job(job_record_t *job_ptr, job_desc_msg_t *job_specs,
 		job_ptr->tres_req_cnt[TRES_ARRAY_CPU],
 		job_specs->min_nodes != NO_VAL ?
 		job_specs->min_nodes :
-		detail_ptr ? detail_ptr->min_nodes : 1);
+		detail_ptr ? detail_ptr->min_nodes : 1,
+		use_part_ptr);
 
 	if (job_specs->licenses && !xstrcmp(job_specs->licenses,
 					    job_ptr->licenses)) {
@@ -15342,7 +15366,7 @@ static void _remove_defunct_batch_dirs(List batch_dirs)
  */
 extern uint64_t job_get_tres_mem(struct job_resources *job_res,
 				 uint64_t pn_min_memory, uint32_t cpu_cnt,
-				 uint32_t node_cnt)
+				 uint32_t node_cnt, part_record_t *part_ptr)
 {
 	uint64_t mem_total = 0;
 	int i;
@@ -15356,6 +15380,9 @@ extern uint64_t job_get_tres_mem(struct job_resources *job_res,
 
 	if (pn_min_memory == NO_VAL64)
 		return mem_total;
+
+	if (pn_min_memory == 0)
+		pn_min_memory = _mem_per_node_part(part_ptr);
 
 	if (pn_min_memory & MEM_PER_CPU) {
 		if (cpu_cnt != NO_VAL) {
