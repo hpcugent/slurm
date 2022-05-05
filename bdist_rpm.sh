@@ -24,7 +24,7 @@ cp slurm.spec "SPECS"
 
 # remove json-c12 -> use plain json-c?
 sudo yum install -y json-c-devel json-c
-if $(grep "release 7" /etc/redhat-release); then
+if grep "release 7" /etc/redhat-release; then
   #   json-c is only needed for restd and burstbuffer
     sudo yum install -y json-c12-devel json-c12
 fi
@@ -33,7 +33,11 @@ fi
 
 # commenting this out since it tries to update things :/
 #sudo yum install -y ucx-devel "pmix-devel > 3.0.0" numactl-devel hwloc-devel
-sudo yum install -y ucx-devel "pmix-devel > 3.0.0" numactl-devel pmix-pmi-devel hwloc-devel-0:1.11.9-3.el8.x86_64
+if grep "release 7" /etc/redhat-release; then
+    sudo yum install -y ucx-devel-1.5.2-1.el7.x86_64 "pmix-devel > 3.0.0" numactl-devel pmix-pmi-devel hwloc-devel-1.11.8-4.el7.x86_64
+else
+    sudo yum install -y ucx-devel-1.8.1-3.el8.x86_64 "pmix-devel > 3.0.0" numactl-devel pmix-pmi-devel hwloc-devel-0:1.11.9-3.el8.x86_64
+fi
 
 # there's no option to pass nvml, it is only autodetected
 # nvidia-driver-devel provides the libnividia-ml.so symlnk, the real .so.1 comes from nvidia-driver-NVML
