@@ -31,7 +31,9 @@ fi
 
 # TODO? also, specify python2 as python to require
 
-sudo yum install -y ucx-devel "pmix-devel > 3.0.0" numactl-devel hwloc-devel
+# commenting this out since it tries to update things :/
+#sudo yum install -y ucx-devel "pmix-devel > 3.0.0" numactl-devel hwloc-devel
+sudo yum install -y ucx-devel "pmix-devel > 3.0.0" numactl-devel pmix-pmi-devel hwloc-devel-0:1.11.9-3.el8.x86_64
 
 # there's no option to pass nvml, it is only autodetected
 # nvidia-driver-devel provides the libnividia-ml.so symlnk, the real .so.1 comes from nvidia-driver-NVML
@@ -41,8 +43,8 @@ sudo yum install -y ucx-devel "pmix-devel > 3.0.0" numactl-devel hwloc-devel
 
 # TODO: what if more than one cuda is available/installed, then the * thingies will probably not work
 # pmix-3 as rebuild from github src.rpm includes the devel rpms in the rpm
-sudo yum remove -y cuda-nvml-dev-10-1 cuda-nvml-dev-10-2
-sudo yum install -y nvidia-driver-devel nvidia-driver-NVML cuda-nvml-devel-11-3-11.3.58-1.x86_64
+sudo yum remove -y cuda-nvml-dev-10-1 cuda-nvml-dev-10-2 cuda-nvml-devel-11-6
+sudo yum install -y nvidia-driver-devel nvidia-driver-NVML cuda-nvml-devel-11-6
 
 
 # glob expansion in list
