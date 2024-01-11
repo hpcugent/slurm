@@ -1,5 +1,5 @@
 Name:		slurm
-Version:	22.05.9
+Version:	22.05.10
 %define rel	1
 Release:        %{rel}.%{gittag}%{?dist}%{?gpu}.ug
 Summary:	Slurm Workload Manager
@@ -140,11 +140,7 @@ BuildRequires: numactl-devel
 %endif
 
 %if %{with pmix} && "%{_with_pmix}" == "--with-pmix"
-%if 0%{?fedora} || 0%{?rhel} > 7
-BuildRequires: pmix-pmi-devel
-%else
 BuildRequires: pmix
-%endif
 %global pmix_version %(rpm -q pmix --qf "%{RPMTAG_VERSION}")
 %endif
 
@@ -239,11 +235,7 @@ Summary: Slurm compute node daemon
 Group: System Environment/Base
 Requires: %{name}%{?_isa} = %{version}-%{release}
 %if %{with pmix} && "%{_with_pmix}" == "--with-pmix"
-%if 0%{?fedora} || 0%{?rhel} > 7
-Requires: pmix-pmi = %{pmix_version}
-%else
 Requires: pmix = %{pmix_version}
-%endif
 %endif
 %if %{with ucx} && "%{_with_ucx}" == "--with-ucx"
 Requires: ucx = %{ucx_version}
