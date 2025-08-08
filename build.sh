@@ -30,19 +30,32 @@ OUR_RELEASE=${RELEASE:-1}
 if grep "release 8.8" /etc/redhat-release; then
     NVIDIA_MAJOR_VERSION=570
     NVIDIA_MINOR_VERSION=133.20
-    NVIDIA_DRIVER=${NVIDIA_DRIVER-${NVIDIA_MAJOR_VERSION}.${NVIDIA_MINOR_VERSION}}
-    NVDRV_NVML_PKG="libnvidia-ml${NVIDIA_DRIVER:+-$NVIDIA_DRIVER}"
     CUDA_VERSION=${CUDA_VERSION:-12.8}
-    CUDA_NVML_PKG="cuda-nvml-devel-${CUDA_VERSION//./-}"
+    UCX_VERSION="1.13.1-2.el8.x86_64"
+    PMIX_VERSION=">= 4.2.6"
+    HWLOC_VERSION=">= 2.2.0-3"
 elif grep "release 9.4" /etc/redhat-release; then
     NVIDIA_MAJOR_VERSION=570
     NVIDIA_MINOR_VERSION=133.20
-    NVIDIA_DRIVER=${NVIDIA_DRIVER-${NVIDIA_MAJOR_VERSION}.${NVIDIA_MINOR_VERSION}}
-    NVDRV_NVML_PKG="libnvidia-ml${NVIDIA_DRIVER:+-$NVIDIA_DRIVER}"
     CUDA_VERSION=${CUDA_VERSION:-12.8}
-    CUDA_NVML_PKG="cuda-nvml-devel-${CUDA_VERSION//./-}"
+    UCX_VERSION="1.15.0-2.el9.x86_64"
+    PMIX_VERSION=">= 4.2.7"
+    HWLOC_VERSION=">= 2.4.1-5"
+elif grep "release 9.6" /etc/redhat-release; then
+    NVIDIA_MAJOR_VERSION=575
+    NVIDIA_MINOR_VERSION=57.08
+    CUDA_VERSION=${CUDA_VERSION:-12.9}
+    UCX_VERSION="1.17.0-2.el9.x86_64"
+    PMIX_VERSION=">= 5.0.8"
+    HWLOC_VERSION=">= 2.4.1-5"
+else
+    echo "unsupported OS release"
+    exit 1
 fi
 
+NVIDIA_DRIVER=${NVIDIA_DRIVER-${NVIDIA_MAJOR_VERSION}.${NVIDIA_MINOR_VERSION}}
+NVDRV_NVML_PKG="libnvidia-ml${NVIDIA_DRIVER:+-$NVIDIA_DRIVER}"
+CUDA_NVML_PKG="cuda-nvml-devel-${CUDA_VERSION//./-}"
 
 
 
@@ -75,25 +88,6 @@ cp slurm.spec "SPECS"
 echo "Installing specfile requires"
 # this goes first because it might install undesired stuff related to `--with` options
 sudo dnf -y builddep slurm.spec
-
-# dependecy versions
-
-if grep "release 8.8" /etc/redhat-release; then
-    UCX_VERSION="1.13.1-2.el8.x86_64"
-    PMIX_VERSION=">= 4.2.6"
-    HWLOC_VERSION=">= 2.2.0-3"
-elif grep "release 9.2" /etc/redhat-release; then
-    UCX_VERSION="1.13.1-2.el9.x86_64"
-    PMIX_VERSION=">= 4.2.7"
-    HWLOC_VERSION=">= 2.4.1-5"
-elif grep "release 9.4" /etc/redhat-release; then
-    UCX_VERSION="1.15.0-2.el9.x86_64"
-    PMIX_VERSION=">= 4.2.7"
-    HWLOC_VERSION=">= 2.4.1-5"
-else
-    echo "unsupported OS release"
-    exit 1
-fi
 
 echo "Installing dependencies"
 # - features: basic
