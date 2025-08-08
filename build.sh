@@ -46,7 +46,7 @@ elif grep "release 9.6" /etc/redhat-release; then
     NVIDIA_MINOR_VERSION=57.08
     CUDA_VERSION=${CUDA_VERSION:-12.9}
     UCX_VERSION="1.17.0-2.el9.x86_64"
-    PMIX_VERSION=">= 5.0.8"
+    PMIX_VERSION=">= 5.0.7"
     HWLOC_VERSION=">= 2.4.1-5"
 else
     echo "unsupported OS release"
