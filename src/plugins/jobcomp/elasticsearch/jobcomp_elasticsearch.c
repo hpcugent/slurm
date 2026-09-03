@@ -141,17 +141,21 @@ static bool thread_shutdown = false;
 static int _load_pending_jobs(void)
 {
 	int i, rc = SLURM_SUCCESS;
-	char *job_data = NULL;
+	char *job_data = NULL, *state_file = NULL;
 	uint32_t job_cnt = 0;
 	buf_t *buffer = NULL;
 	struct job_node *jnode;
 
 	slurm_mutex_lock(&save_lock);
-	if (!(buffer = jobcomp_common_load_state_file(save_state_file))) {
+	if (!(buffer = state_save_open(save_state_file, &state_file))) {
+		error("Could not open jobcomp state file %s: %m", state_file);
+		error("NOTE: Finished jobs may be lost!");
 		slurm_mutex_unlock(&save_lock);
+		xfree(state_file);
 		return SLURM_ERROR;
 	}
 	slurm_mutex_unlock(&save_lock);
+	xfree(state_file);
 
 	safe_unpack32(&job_cnt, buffer);
 	for (i = 0; i < job_cnt; i++) {
@@ -196,9 +200,9 @@ static int _index_job(const char *jobcomp)
 		return SLURM_ERROR;
 	}
 
-	rc = slurm_curl_request(jobcomp, log_url, NULL, NULL, slist, 0,
-				&response_str, &response_code,
-				HTTP_REQUEST_POST, false);
+	rc = slurm_curl_request(jobcomp, log_url, NULL, NULL, NULL, NULL, NULL,
+				slist, 0, &response_str, &response_code,
+				HTTP_REQUEST_POST, false, false);
 	/*
 	 * HTTP 200 (OK)	- request succeed.
 	 * HTTP 201 (Created)	- request succeed and resource created.
@@ -245,7 +249,7 @@ static int _save_state(void)
 	return rc;
 }
 
-extern int jobcomp_p_log_record(job_record_t *job_ptr)
+extern int jobcomp_p_record_job_end(job_record_t *job_ptr, uint32_t event)
 {
 	struct job_node *jnode = NULL;
 	data_t *record = NULL;
@@ -257,7 +261,7 @@ extern int jobcomp_p_log_record(job_record_t *job_ptr)
 		return SLURM_ERROR;
 	}
 
-	record = jobcomp_common_job_record_to_data(job_ptr);
+	record = jobcomp_common_job_record_to_data(job_ptr, event);
 	jnode = xmalloc(sizeof(struct job_node));
 	if ((rc = serialize_g_data_to_string(&jnode->serialized_job, NULL,
 					     record, MIME_TYPE_JSON,
@@ -323,20 +327,11 @@ static void _jobslist_del(void *x)
 	xfree(jnode);
 }
 
-/*
- * init() is called when the plugin is loaded, before any other functions
- * are called. Put global initialization here.
- */
 extern int init(void)
 {
-	int rc;
+	serializer_required(MIME_TYPE_JSON);
 
-	if ((rc = serializer_g_init(MIME_TYPE_JSON_PLUGIN, NULL))) {
-		error("%s: unable to load JSON serializer: %s",
-		      __func__, slurm_strerror(rc));
-		return rc;
-	}
-
+	jobcomp_common_conf_init();
 	jobslist = list_create(_jobslist_del);
 	slurm_thread_create(&job_handler_thread, _process_jobs, NULL);
 	slurm_mutex_lock(&pend_jobs_lock);
@@ -349,7 +344,7 @@ extern int init(void)
 	return SLURM_SUCCESS;
 }
 
-extern int fini(void)
+extern void fini(void)
 {
 	thread_shutdown = true;
 	slurm_thread_join(job_handler_thread);
@@ -358,9 +353,8 @@ extern int fini(void)
 	FREE_NULL_LIST(jobslist);
 	xfree(log_url);
 
+	jobcomp_common_conf_fini();
 	slurm_curl_fini();
-
-	return SLURM_SUCCESS;
 }
 
 /*
@@ -396,4 +390,9 @@ extern list_t *jobcomp_p_get_jobs(slurmdb_job_cond_t *job_cond)
 {
 	debug("%s function is not implemented", __func__);
 	return NULL;
+}
+
+extern int jobcomp_p_record_job_start(job_record_t *job_ptr, uint32_t event)
+{
+	return SLURM_SUCCESS;
 }

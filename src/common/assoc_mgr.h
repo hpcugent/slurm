@@ -138,6 +138,7 @@ extern bool verify_assoc_unlock(assoc_mgr_lock_datatype_t datatype);
 #endif
 
 extern int assoc_mgr_find_nondirect_coord_by_name(void *x, void *y);
+extern int assoc_mgr_find_flag_coord_by_name(void *x, void *y);
 
 /* ran after a new tres_list is given */
 extern int assoc_mgr_post_tres_list(list_t *new_list);
@@ -491,7 +492,7 @@ extern void assoc_mgr_set_uid(uid_t uid, char *username);
  * Sets the uids of users added to the system after the start of the
  * calling program.
  */
-extern int assoc_mgr_set_missing_uids(void);
+extern int assoc_mgr_set_missing_uids(bool *uid_set);
 
 /* Normalize shares for an association. External so a priority plugin
  * can call it if needed.
@@ -595,7 +596,7 @@ extern void assoc_mgr_get_default_qos_info(
  * Calculate a weighted tres value.
  * IN: tres_cnt - array of tres values of size g_tres_count.
  * IN: weights - weights to apply to tres values of size g_tres_count.
- * IN: flags - priority flags (toogle between MAX or SUM of tres).
+ * IN: flags - priority flags (toggle between MAX or SUM of tres).
  * IN: locked - whether the tres read assoc mgr lock is locked or not.
  * RET: returns the calculated tres weight.
  */
@@ -634,10 +635,11 @@ extern void assoc_mgr_set_job_tres_alloc_str(job_record_t *job_ptr,
  * Check if any assoc job limits are increasing the current ones.
  * IN: assoc - assoc to check
  * IN/OUT: str - description of parameter found to be increasing the limit
+ * IN: assoc_tres_locked - if true ASSOC_LOCK and TRES_LOCK already owned
  * RET: returns true if any limit is increasing the current one
  */
 extern bool assoc_mgr_check_assoc_lim_incr(slurmdb_assoc_rec_t *assoc,
-					   char **str);
+					   char **str, bool assoc_tres_locked);
 
 /*
  * Verify a User 'coord_name' is a coordinator of all the qos in qos_list
@@ -645,10 +647,12 @@ extern bool assoc_mgr_check_assoc_lim_incr(slurmdb_assoc_rec_t *assoc,
  * IN: account: Account name we are interested in.
  * IN: coord_name: User name given.
  * IN: qos_list: list of all QOS we need to verify.
+ * IN: assoc_mgr_locked: if true assoc_mgr assoc/user locks are already owned
  * RET: true if they are or false if they are not
  */
 extern bool assoc_mgr_check_coord_qos(char *cluster_name, char *account,
-				     char *coord_name, list_t *qos_list);
+				      char *coord_name, list_t *qos_list,
+				      bool assoc_mgr_locked);
 
 /*
  * Here we are checking to see if the association given has the flag

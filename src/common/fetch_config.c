@@ -51,16 +51,38 @@
 #include "src/common/xstring.h"
 #include "src/common/xmalloc.h"
 
+#include "src/interfaces/conn.h"
+
+/* Define slurm-specific aliases for use by plugins, see slurm_xlator.h. */
+strong_alias(dump_to_memfd, slurm_dump_to_memfd);
+
 static char *slurmd_config_files[] = {
-	"slurm.conf", "acct_gather.conf", "cgroup.conf",
-	"cli_filter.lua", "gres.conf", "helpers.conf",
-	"job_container.conf", "mpi.conf", "oci.conf",
-	"plugstack.conf", "scrun.lua", "topology.conf", NULL
+	"acct_gather.conf",
+	"cgroup.conf",
+	"cli_filter.lua",
+	"gres.conf",
+	"helpers.conf",
+	"job_container.conf",
+	"mpi.conf",
+	"namespace.yaml",
+	"oci.conf",
+	"plugstack.conf",
+	"scrun.lua",
+	"slurm.conf",
+	"topology.conf",
+	"topology.yaml",
+	NULL,
 };
 
 static char *client_config_files[] = {
-	"slurm.conf", "cli_filter.lua", "plugstack.conf", "topology.conf",
-	"oci.conf", "scrun.lua", NULL
+	"cli_filter.lua",
+	"oci.conf",
+	"plugstack.conf",
+	"scrun.lua",
+	"slurm.conf",
+	"topology.conf",
+	"topology.yaml",
+	NULL,
 };
 
 
@@ -76,6 +98,7 @@ static config_response_msg_t *_fetch_parent(pid_t pid)
 	config_response_msg_t *config = NULL;
 	int status;
 
+	close(to_parent[1]);
 	safe_read(to_parent[0], &len, sizeof(int));
 
 	/*
@@ -86,7 +109,7 @@ static config_response_msg_t *_fetch_parent(pid_t pid)
 	if (len <= 0) {
 		waitpid(pid, &status, 0);
 		debug2("%s: status from child %d", __func__, status);
-		return NULL;
+		goto closepipe;
 	}
 
 	buffer = init_buf(len);
@@ -99,27 +122,34 @@ static config_response_msg_t *_fetch_parent(pid_t pid)
 				       SLURM_PROTOCOL_VERSION)) {
 		FREE_NULL_BUFFER(buffer);
 		error("%s: unpack failed", __func__);
-		return NULL;
+		goto closepipe;
 	}
 	FREE_NULL_BUFFER(buffer);
 
+	close(to_parent[0]);
 	return config;
 
 rwfail:
 	error("%s: failed to read from child: %m", __func__);
 	waitpid(pid, &status, 0);
 	debug2("%s: status from child %d", __func__, status);
-
+closepipe:
+	close(to_parent[0]);
 	return NULL;
 }
 
-static void _fetch_child(list_t *controllers, uint32_t flags)
+static void _fetch_child(list_t *controllers, uint32_t flags, uint16_t port,
+			 char *ca_cert_file)
 {
+	slurm_msg_t msg_wrap = {
+		.protocol_version = SLURM_PROTOCOL_VERSION,
+	};
 	config_response_msg_t *config;
 	ctl_entry_t *ctl = NULL;
 	buf_t *buffer = init_buf(1024 * 1024);
 	int len = 0;
 
+	close(to_parent[0]);
 	setenv("SLURM_CONFIG_FETCH", "1", 1);
 
 	/*
@@ -131,6 +161,21 @@ static void _fetch_child(list_t *controllers, uint32_t flags)
 	 */
 	slurm_conf_unlock();
 
+	if (ca_cert_file) {
+		slurm_conf.plugindir = xstrdup(default_plugin_path);
+		slurm_conf.tls_type = xstrdup("tls/s2n");
+
+		/* certmgr plugin will be loaded after getting configuration */
+		if (conn_g_init()) {
+			error("--ca-cert-file was specified but TLS plugin failed to load");
+			goto rwfail;
+		}
+		if (conn_g_load_ca_cert(ca_cert_file)) {
+			error("Failed to load certificate file '%s'", ca_cert_file);
+			goto rwfail;
+		}
+	}
+
 	ctl = list_peek(controllers);
 
 	if (ctl->has_ipv6 && !ctl->has_ipv4)
@@ -138,31 +183,35 @@ static void _fetch_child(list_t *controllers, uint32_t flags)
 	else
 		_init_minimal_conf_server_config(controllers, false, false);
 
-	config = fetch_config_from_controller(flags);
+	config = fetch_config_from_controller(flags, port);
 
 	if (!config && ctl->has_ipv6 && ctl->has_ipv4) {
 		warning("%s: failed to fetch remote configs via IPv4, retrying with IPv6: %m",
 			__func__);
 		_init_minimal_conf_server_config(controllers, true, true);
-		config = fetch_config_from_controller(flags);
+		config = fetch_config_from_controller(flags, port);
 	}
 
 	if (!config) {
 		error("%s: failed to fetch remote configs: %m", __func__);
 		safe_write(to_parent[1], &len, sizeof(int));
-		_exit(1);
+		goto closepipe;
 	}
 
-	pack_config_response_msg(config, buffer, SLURM_PROTOCOL_VERSION);
+	msg_wrap.data = config;
+	pack_config_response_msg(&msg_wrap, buffer);
 
 	len = buffer->processed;
 	safe_write(to_parent[1], &len, sizeof(int));
 	safe_write(to_parent[1], buffer->head, len);
+	close(to_parent[1]);
 
 	_exit(0);
 
 rwfail:
 	error("%s: failed to write to parent: %m", __func__);
+closepipe:
+	close(to_parent[1]);
 	_exit(1);
 }
 
@@ -176,7 +225,9 @@ static int _get_controller_addr_type(void *x, void *arg)
 	return SLURM_SUCCESS;
 }
 
-extern config_response_msg_t *fetch_config(char *conf_server, uint32_t flags)
+extern config_response_msg_t *fetch_config(char *conf_server, uint32_t flags,
+					   uint16_t sackd_port,
+					   char *ca_cert_file)
 {
 	char *env_conf_server = getenv("SLURM_CONF_SERVER");
 	list_t *controllers = NULL;
@@ -239,8 +290,14 @@ extern config_response_msg_t *fetch_config(char *conf_server, uint32_t flags)
 	list_for_each(controllers, _get_controller_addr_type, NULL);
 
 	/* If the slurm.key file exists, assume we're using auth/slurm */
-	sack_jwks = get_extra_conf_path("slurm.jwks");
-	sack_key = get_extra_conf_path("slurm.key");
+	sack_jwks = xstrdup(getenv("SLURM_SACK_JWKS"));
+	sack_key = xstrdup(getenv("SLURM_SACK_KEY"));
+
+	if (!sack_jwks)
+		sack_jwks = get_extra_conf_path("slurm.jwks");
+	if (!sack_key)
+		sack_key = get_extra_conf_path("slurm.key");
+
 	if (!stat(sack_jwks, &statbuf))
 		setenv("SLURM_SACK_JWKS", sack_jwks, 1);
 	else if (!stat(sack_key, &statbuf))
@@ -268,11 +325,12 @@ extern config_response_msg_t *fetch_config(char *conf_server, uint32_t flags)
 		return _fetch_parent(pid);
 	}
 
-	_fetch_child(controllers, flags);
+	_fetch_child(controllers, flags, sackd_port, ca_cert_file);
 	_exit(0);
 }
 
-extern config_response_msg_t *fetch_config_from_controller(uint32_t flags)
+extern config_response_msg_t *fetch_config_from_controller(uint32_t flags,
+							   uint16_t port)
 {
 	int rc;
 	slurm_msg_t req_msg;
@@ -285,6 +343,7 @@ extern config_response_msg_t *fetch_config_from_controller(uint32_t flags)
 
 	memset(&req, 0, sizeof(req));
 	req.flags = flags;
+	req.port = port;
 	req_msg.msg_type = REQUEST_CONFIG;
 	req_msg.data = &req;
 
@@ -585,7 +644,7 @@ extern config_response_msg_t *new_config_response(bool to_slurmd)
 	}
 
 	/*
-	 * Load Prolog and Epilog scripts.
+	 * Load Prolog, Epilog, TaskProlog, and TaskEpilog scripts.
 	 * Only load if a non-absolute path is provided, this is our
 	 * indication that the file should be sent out, and matches
 	 * configuration semantics for the Include lines.
@@ -601,6 +660,12 @@ extern config_response_msg_t *new_config_response(bool to_slurmd)
 				_load_conf2list(msg, slurm_conf.epilog[i],
 						true);
 		}
+		if ((slurm_conf.task_prolog) &&
+		    (slurm_conf.task_prolog[0] != '/'))
+			_load_conf2list(msg, slurm_conf.task_prolog, true);
+		if ((slurm_conf.task_epilog) &&
+		    (slurm_conf.task_epilog[0] != '/'))
+			_load_conf2list(msg, slurm_conf.task_epilog, true);
 	}
 
 	return msg;

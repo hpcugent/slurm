@@ -94,6 +94,9 @@ static void _run_sack_maybe(void)
 	if (xstrstr(slurm_conf.authinfo, "disable_sack"))
 		run_sack = false;
 
+	if (running_in_slurmstepd())
+		run_sack = false;
+
 	if (running_in_sackd())
 		run_sack = true;
 
@@ -107,16 +110,23 @@ static void _run_sack_maybe(void)
 extern int init(void)
 {
 	static bool init_run = false;
-	bool run = false, set = false;
+	bool need_key = run_in_daemon(IS_SACKD | IS_SLURMD | IS_SLURMCTLD |
+				      IS_SLURMDBD | IS_STEPMGR);
 
-	if (init_run)
+	/*
+	 * auth/slurm and cred/slurm plugins use the same .so, so they get
+	 * double init()'ed. We detect that the stepd is the stepmgr after the
+	 * first init(), auth_g_init(), and we need to be able to init() on the
+	 * second init(), creg_g_init(), as a daemon.
+	 */
+	if (init_run && (!need_key || internal))
 		return SLURM_SUCCESS;
+
 	init_run = true;
 
-	if (serializer_g_init(MIME_TYPE_JSON_PLUGIN, NULL))
-		fatal("%s: serializer_g_init() failed", __func__);
+	serializer_required(MIME_TYPE_JSON);
 
-	internal = run_in_daemon(&run, &set, "sackd,slurmd,slurmctld,slurmdbd");
+	internal = need_key;
 
 	if (internal) {
 		debug("running as daemon");
@@ -136,12 +146,12 @@ extern int init(void)
 	return SLURM_SUCCESS;
 }
 
-extern int fini(void)
+extern void fini(void)
 {
 	static bool fini_run = false;
 
 	if (fini_run)
-		return SLURM_SUCCESS;
+		return;
 	fini_run = true;
 
 	if (internal) {
@@ -153,8 +163,6 @@ extern int fini(void)
 		 */
 		fini_internal();
 	}
-
-	return SLURM_SUCCESS;
 }
 
 extern auth_cred_t *auth_p_create(char *auth_info, uid_t r_uid, void *data,

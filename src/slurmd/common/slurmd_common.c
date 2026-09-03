@@ -42,6 +42,8 @@
 #include "src/slurmd/common/slurmd_common.h"
 #include "src/slurmd/slurmd/slurmd.h"
 
+#define EPILOG_SYNC_MIN_HOSTS 64
+
 typedef struct {
 	uint32_t job_id;
 	uint16_t msg_timeout;
@@ -53,10 +55,11 @@ typedef struct {
 static pthread_mutex_t prolog_serial_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /*
- * Delay a message based upon the host index, total host count and RPC_TIME.
+ * Delay a message based upon the host index, total host count and
+ * usec_per_rpc.
  * This logic depends upon synchronized clocks across the cluster.
  */
-static void _delay_rpc(int host_inx, int host_cnt, int usec_per_rpc)
+static void _delay_rpc(int host_inx, int host_cnt, uint32_t usec_per_rpc)
 {
 	struct timeval tv1;
 	uint32_t cur_time;	/* current time in usec (just 9 digits) */
@@ -65,6 +68,11 @@ static void _delay_rpc(int host_inx, int host_cnt, int usec_per_rpc)
 	uint32_t target_time;	/* desired time to issue the RPC */
 	uint32_t delta_time;
 
+	if ((usec_per_rpc == 0) || (usec_per_rpc > EPILOG_MSG_TIME_MAX)) {
+		error("%s: invalid usec_per_rpc=%u, using default %u",
+		      __func__, usec_per_rpc, DEFAULT_EPILOG_MSG_TIME);
+		usec_per_rpc = DEFAULT_EPILOG_MSG_TIME;
+	}
 again:
 	if (gettimeofday(&tv1, NULL)) {
 		usleep(host_inx * usec_per_rpc);
@@ -89,12 +97,11 @@ again:
 	}
 }
 
-
 /*
  * On a parallel job, every slurmd may send the EPILOG_COMPLETE message to the
  * slurmctld at the same time, resulting in lost messages. We add a delay here
- * to spead out the message traffic assuming synchronized clocks across the
- * cluster. Allow 10 msec processing time in slurmctld for each RPC.
+ * to spread out the message traffic assuming synchronized clocks across the
+ * cluster. Delay per host is controlled by EpilogMsgTime (usec).
  */
 static void _sync_messages_kill(char *node_list)
 {
@@ -104,8 +111,7 @@ static void _sync_messages_kill(char *node_list)
 
 	hosts = hostset_create(node_list);
 	host_cnt = hostset_count(hosts);
-
-	if (host_cnt <= 64)
+	if (host_cnt <= EPILOG_SYNC_MIN_HOSTS)
 		goto fini;
 	if (!conf->hostname)
 		goto fini;	/* should never happen */
@@ -133,7 +139,7 @@ fini:
  * Returns SLURM_SUCCESS if message sent successfully,
  *         SLURM_ERROR if epilog complete message fails to be sent.
  */
-extern int epilog_complete(uint32_t jobid, char *node_list, int rc)
+extern int epilog_complete(slurm_step_id_t *step_id, char *node_list, int rc)
 {
 	slurm_msg_t msg;
 	epilog_complete_msg_t req;
@@ -143,7 +149,7 @@ extern int epilog_complete(uint32_t jobid, char *node_list, int rc)
 	slurm_msg_t_init(&msg);
 	memset(&req, 0, sizeof(req));
 
-	req.job_id = jobid;
+	req.step_id = *step_id;
 	req.return_code = rc;
 	req.node_name = conf->node_name;
 
@@ -161,12 +167,12 @@ extern int epilog_complete(uint32_t jobid, char *node_list, int rc)
 		return SLURM_ERROR;
 	}
 
-	debug("JobId=%u: sent epilog complete msg: rc = %d", jobid, rc);
+	debug("%pI: sent epilog complete msg: rc = %d", step_id, rc);
 
 	return SLURM_SUCCESS;
 }
 
-extern bool is_job_running(uint32_t job_id, bool ignore_extern)
+static bool _is_job_running(slurm_step_id_t *step_id, bool ignore_extern)
 {
 	bool retval = false;
 	list_t *steps;
@@ -177,7 +183,7 @@ extern bool is_job_running(uint32_t job_id, bool ignore_extern)
 	i = list_iterator_create(steps);
 	while ((s = list_next(i))) {
 		int fd;
-		if (s->step_id.job_id != job_id)
+		if (s->step_id.job_id != step_id->job_id)
 			continue;
 		if (ignore_extern && (s->step_id.step_id == SLURM_EXTERN_CONT))
 			continue;
@@ -207,7 +213,7 @@ extern bool is_job_running(uint32_t job_id, bool ignore_extern)
  *
  *  Returns true if all job processes are gone
  */
-extern bool pause_for_job_completion(uint32_t job_id, int max_time,
+extern bool pause_for_job_completion(slurm_step_id_t *step_id, int max_time,
 				     bool ignore_extern)
 {
 	int sec = 0;
@@ -216,11 +222,11 @@ extern bool pause_for_job_completion(uint32_t job_id, int max_time,
 	int count = 0;
 
 	while ((sec < max_time) || (max_time == 0)) {
-		rc = is_job_running(job_id, ignore_extern);
+		rc = _is_job_running(step_id, ignore_extern);
 		if (!rc)
 			break;
 		if ((max_time == 0) && (sec > 1)) {
-			terminate_all_steps(job_id, true, !ignore_extern);
+			terminate_all_steps(step_id, true, !ignore_extern);
 		}
 		if (sec > 10) {
 			/* Reduce logging frequency about unkillable tasks */
@@ -261,13 +267,14 @@ extern bool pause_for_job_completion(uint32_t job_id, int max_time,
 
 /*
  * terminate_all_steps - signals the container of all steps of a job
- * jobid IN - id of job to signal
+ * step_id IN - id of job to signal
  * batch IN - if true signal batch script, otherwise skip it
  * extern_step IN - if true signal extern step, otherwise skip it
 
  * RET count of signaled job steps (plus batch script, if applicable)
  */
-extern int terminate_all_steps(uint32_t jobid, bool batch, bool extern_step)
+extern int terminate_all_steps(slurm_step_id_t *step_id, bool batch,
+			       bool extern_step)
 {
 	list_t *steps;
 	list_itr_t *i;
@@ -278,10 +285,10 @@ extern int terminate_all_steps(uint32_t jobid, bool batch, bool extern_step)
 	steps = stepd_available(conf->spooldir, conf->node_name);
 	i = list_iterator_create(steps);
 	while ((stepd = list_next(i))) {
-		if (stepd->step_id.job_id != jobid) {
+		if (stepd->step_id.job_id != step_id->job_id) {
 			/* multiple jobs expected on shared nodes */
-			debug3("Step from other job: jobid=%u (this jobid=%u)",
-			       stepd->step_id.job_id, jobid);
+			debug3("Step from other job: %pI (this %pI)",
+			       &stepd->step_id, step_id);
 			continue;
 		}
 
@@ -308,7 +315,7 @@ extern int terminate_all_steps(uint32_t jobid, bool batch, bool extern_step)
 	list_iterator_destroy(i);
 	FREE_NULL_LIST(steps);
 	if (step_cnt == 0)
-		debug2("No steps in job %u to terminate", jobid);
+		debug2("No steps in %pI to terminate", step_id);
 	return step_cnt;
 }
 
@@ -379,7 +386,7 @@ extern int run_prolog(job_env_t *job_env, slurm_cred_t *cred)
 		script_lock = true;
 	}
 
-	timer_struct.job_id      = job_env->jobid;
+	timer_struct.job_id = job_env->step_id.job_id;
 	timer_struct.msg_timeout = slurm_conf.msg_timeout;
 	timer_struct.prolog_fini = &prolog_fini;
 	timer_struct.timer_cond  = &timer_cond;
@@ -395,8 +402,8 @@ extern int run_prolog(job_env_t *job_env, slurm_cred_t *cred)
 
 	diff_time = difftime(time(NULL), start_time);
 	if (diff_time >= (slurm_conf.msg_timeout / 2)) {
-		info("prolog for job %u ran for %d seconds",
-		     job_env->jobid, diff_time);
+		info("prolog for %pI ran for %d seconds",
+		     &job_env->step_id, diff_time);
 	}
 
 	slurm_thread_join(timer_id);
@@ -434,8 +441,8 @@ extern int run_epilog(job_env_t *job_env, slurm_cred_t *cred)
 
 	diff_time = difftime(time(NULL), start_time);
 	if (diff_time >= (slurm_conf.msg_timeout / 2)) {
-		info("epilog for job %u ran for %d seconds",
-		     job_env->jobid, diff_time);
+		info("epilog for %pI ran for %d seconds",
+		     &job_env->step_id, diff_time);
 	}
 
 	if (script_lock)

@@ -48,6 +48,7 @@
 #include "src/interfaces/acct_gather_energy.h"
 #include "src/common/slurm_protocol_defs.h"
 #include "src/common/fd.h"
+#include "src/common/xrandom.h"
 #include "src/common/xstring.h"
 
 #include "src/interfaces/proctrack.h"
@@ -473,17 +474,11 @@ static xcc_raw_single_data_t *_read_ipmi_values(ipmi_ctx_t *ipmi_ctx_p)
 	xcc_reading = xmalloc(sizeof(xcc_raw_single_data_t));
 	if (slurm_ipmi_conf.flags & XCC_FLAG_FAKE) {
 		static uint32_t fake_past_read = 10774496;
-		static bool fake_inited = false;
-
-		if (!fake_inited) {
-			srand((unsigned) time(NULL));
-			fake_inited = true;
-		}
 
 		xcc_reading->version = XCC_SD650_VERSION;
 		xcc_reading->fifo_inx = 0;
 		// Fake metric j
-		xcc_reading->j = fake_past_read + 550 + rand() % 200;
+		xcc_reading->j = fake_past_read + 550 + xrandom() % 200;
 		fake_past_read = xcc_reading->j;
 		xcc_reading->mj = 0;
 		xcc_reading->w = 0;
@@ -796,7 +791,7 @@ static void *_thread_ipmi_run(void *no_data)
 
 static void *_thread_launcher(void *no_data)
 {
-	//what arg would countain? frequency, socket?
+	//what arg would contain? frequency, socket?
 	struct timeval tvnow;
 	struct timespec abs;
 
@@ -819,13 +814,16 @@ static void *_thread_launcher(void *no_data)
 
 		/*
 		 * It is a known thing we can hang up on IPMI calls cancel if
-		 * we must.
+		 * we must. This might not be safe if we're stuck in the driver
+		 * and have some glibc lock locked. We will cancel the thread
+		 * but maybe we will end up deadlocked. This is a best effort.
 		 */
 		pthread_cancel(thread_ipmi_id_run);
 
 		/*
 		 * Unlock just to make sure since we could have canceled the
-		 * thread while in the lock.
+		 * thread while in the lock. This demonstrates how dangerous
+		 * it is to cancel a thread at random points in the code.
 		 */
 		slurm_mutex_unlock(&ipmi_mutex);
 	}
@@ -903,19 +901,15 @@ end_it:
 	return SLURM_SUCCESS;
 }
 
-/*
- * init() is called when the plugin is loaded, before any other functions
- * are called.  Put global initialization here.
- */
 extern int init(void)
 {
 	return SLURM_SUCCESS;
 }
 
-extern int fini(void)
+extern void fini(void)
 {
 	if (!running_in_slurmd_stepd())
-		return SLURM_SUCCESS;
+		return;
 
 	flag_energy_accounting_shutdown = true;
 
@@ -932,8 +926,6 @@ extern int fini(void)
 	slurm_mutex_unlock(&ipmi_mutex);
 
 	slurm_thread_join(thread_ipmi_id_run);
-
-	return SLURM_SUCCESS;
 }
 
 extern int acct_gather_energy_p_update_node_energy(void)

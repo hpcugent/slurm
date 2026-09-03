@@ -80,6 +80,7 @@ typedef struct {
 	sbcast_cred_t *(*sbcast_create)	(sbcast_cred_arg_t *cred,
 					 uint16_t protocol_version);
 	sbcast_cred_t *(*sbcast_unpack)	(buf_t *buffer, bool verify,
+					 bool replay_okay,
 					 uint16_t protocol_version);
 } slurm_cred_ops_t;
 
@@ -198,6 +199,8 @@ extern slurm_cred_t *slurm_cred_create(slurm_cred_arg_t *arg, bool sign_it,
 	xassert(arg);
 	xassert(g_context);
 
+	debug("%s: creating credential for %pI", __func__, &arg->step_id);
+
 	if (arg->uid == SLURM_AUTH_NOBODY) {
 		error("%s: refusing to create job %u credential for invalid user nobody",
 		      __func__, arg->step_id.job_id);
@@ -269,6 +272,7 @@ extern void slurm_cred_free_args(slurm_cred_arg_t *arg)
 	xfree(arg->job_alias_list);
 	xfree(arg->job_comment);
 	xfree(arg->job_constraints);
+	xfree(arg->job_extra);
 	xfree(arg->job_licenses);
 	xfree(arg->job_hostlist);
 	xfree(arg->sock_core_rep_count);
@@ -278,13 +282,14 @@ extern void slurm_cred_free_args(slurm_cred_arg_t *arg)
 	xfree(arg->job_node_addrs);
 	xfree(arg->job_partition);
 	xfree(arg->job_reservation);
+	xfree(arg->job_selinux_context);
 	xfree(arg->job_std_err);
 	xfree(arg->job_std_in);
 	xfree(arg->job_std_out);
 	xfree(arg->step_mem_alloc);
 	xfree(arg->step_mem_alloc_rep_count);
 
-	switch_g_free_stepinfo(arg->switch_step);
+	switch_g_stepinfo_free(arg->switch_step);
 
 	xfree(arg);
 }
@@ -521,11 +526,7 @@ extern void format_core_allocs(slurm_cred_t *credential, char *node_name,
 		      cred->job_hostlist);
 		return;
 	}
-#ifdef HAVE_FRONT_END
-	host_index = 0;
-#else
 	host_index = hostlist_find(hset, node_name);
-#endif
 	if ((host_index < 0) || (host_index >= cred->job_nhosts)) {
 		error("Invalid host_index %d for job %u",
 		      host_index, cred->step_id.job_id);
@@ -559,16 +560,6 @@ extern void format_core_allocs(slurm_cred_t *credential, char *node_name,
 			bit_set(job_core_bitmap, j);
 		if (bit_test(cred->step_core_bitmap, i))
 			bit_set(step_core_bitmap, j);
-	}
-
-	/* Scale CPU count, same as slurmd/req.c:_get_ncpus() */
-	if (i_last_bit <= i_first_bit)
-		error("step credential has no CPUs selected");
-	else {
-		uint32_t i = cpus / (i_last_bit - i_first_bit);
-		if (i > 1)
-			debug2("scaling CPU count by factor of %d (%u/(%u-%u)",
-			       i, cpus, i_last_bit, i_first_bit);
 	}
 
 	slurm_cred_get_mem(credential, node_name, __func__, job_mem_limit,
@@ -608,11 +599,7 @@ extern void get_cred_gres(slurm_cred_t *credential, char *node_name,
 		      cred->job_hostlist);
 		return;
 	}
-#ifdef HAVE_FRONT_END
-	host_index = 0;
-#else
 	host_index = hostlist_find(hset, node_name);
-#endif
 	hostlist_destroy(hset);
 	if ((host_index < 0) || (host_index >= cred->job_nhosts)) {
 		error("Invalid host_index %d for job %u",
@@ -738,18 +725,27 @@ extern sbcast_cred_t *unpack_sbcast_cred(buf_t *buffer, void *msg,
 					 uint16_t protocol_version)
 {
 	file_bcast_msg_t *bmsg = msg;
-	bool verify = false;
+	bool verify = false, replay_okay = false;
 
-	if (bmsg && (bmsg->block_no == 1) && !(bmsg->flags & FILE_BCAST_SO))
+	if (bmsg && (bmsg->block_no == 1)) {
 		verify = true;
+		/*
+		 * One credential covers the executable and every shared
+		 * object sent after it, so munged only sees it a second
+		 * time on the shared object transfers.
+		 */
+		replay_okay = (bmsg->flags & FILE_BCAST_SO);
+	}
 
-	return (*(ops.sbcast_unpack))(buffer, verify, protocol_version);
+	return (*(ops.sbcast_unpack))(buffer, verify, replay_okay,
+				      protocol_version);
 }
 
 extern void print_sbcast_cred(sbcast_cred_t *sbcast_cred)
 {
-	info("Sbcast_cred: JobId   %u", sbcast_cred->arg.job_id);
-	info("Sbcast_cred: StepId  %u", sbcast_cred->arg.step_id);
+	info("Sbcast_cred: JobId   %u", sbcast_cred->arg.step_id.job_id);
+	info("Sbcast_cred: HetJobId %u", sbcast_cred->arg.het_job_id);
+	info("Sbcast_cred: StepId  %u", sbcast_cred->arg.step_id.step_id);
 	info("Sbcast_cred: Nodes   %s", sbcast_cred->arg.nodes);
 	info("Sbcast_cred: ctime   %s", slurm_ctime2(&sbcast_cred->ctime));
 	info("Sbcast_cred: Expire  %s", slurm_ctime2(&sbcast_cred->arg.expiration));

@@ -306,16 +306,11 @@ again:
  *
  * RETVAL:	==0 - no valid data
  * 		!=0 - data are valid
- *
- * Based upon stat2proc() from the ps command. It can handle arbitrary
- * executable file basenames for `cmd', i.e. those with embedded whitespace or
- * embedded ')'s. Such names confuse %s (see scanf(3)), so the string is split
- * and %39c is used instead. (except for embedded ')' "(%[^)]c)" would work.
  */
 static int _get_process_data_line(int in, jag_prec_t *prec) {
 	char sbuf[512], *tmp;
 	int num_read, nvals;
-	char cmd[40], state[1];
+	char state[1];
 	int ppid, pgrp, session, tty_nr, tpgid;
 	long unsigned flags, minflt, cminflt, majflt, cmajflt;
 	long unsigned utime, stime, starttime, vsize;
@@ -329,16 +324,17 @@ static int _get_process_data_line(int in, jag_prec_t *prec) {
 	sbuf[num_read] = '\0';
 
 	/*
-	 * split into "PID (cmd" and "<rest>" replace trailing ')' with NULL
+	 * Split on the last ')' to handle cmd names with embedded ')'.
+	 * After the split sbuf holds "PID (cmd" and tmp+2 holds the rest.
 	 */
 	tmp = strrchr(sbuf, ')');
 	if (!tmp)
 		return 0;
 	*tmp = '\0';
 
-	/* parse these two strings separately, skipping the leading "(". */
-	nvals = sscanf(sbuf, "%d (%39c", &prec->pid, cmd);
-	if (nvals < 2)
+	/* parse the PID from the first segment, skipping the leading "(". */
+	nvals = sscanf(sbuf, "%d (", &prec->pid);
+	if (nvals < 1)
 		return 0;
 
 	nvals = sscanf(tmp + 2,	 /* skip space after ')' too */
@@ -376,7 +372,7 @@ static int _get_process_data_line(int in, jag_prec_t *prec) {
 
 	/*
 	 * Store unnormalized times, we will normalize in when
-	 * transfering to a struct jobacctinfo in job_common_poll_data()
+	 * transferring to a struct jobacctinfo in job_common_poll_data()
 	 */
 	prec->usec = (double)utime;
 	prec->ssec = (double)stime;
@@ -1089,70 +1085,87 @@ extern void jag_common_poll_data(list_t *task_list, uint64_t cont_id,
 		double cpu_calc;
 		double last_total_cputime;
 		jag_prec_t *permanent_anc;
-		if (!(prec = list_find_first(prec_list, _find_prec,
-					     &jobacct->pid)))
-			continue;
-		/*
-		 * We can't use the prec from the list as we need to keep it in
-		 * the original state without offspring since we reuse this list
-		 * keeping around precs after they end.
-		 */
-		memcpy(&tmp_prec, prec, sizeof(*prec));
-		permanent_anc = prec;
-		prec = &tmp_prec;
-
-		if (acct_gather_filesystem_g_get_data(prec->tres_data) < 0) {
-			log_flag(JAG, "problem retrieving filesystem data");
-		}
-
-		if (acct_gather_interconnect_g_get_data(prec->tres_data) < 0) {
-			log_flag(JAG, "problem retrieving interconnect data");
-		}
-		/* find all my descendents */
-		if (callbacks->get_offspring_data)
-			(*(callbacks->get_offspring_data))
-				(prec_list, prec, prec->pid, permanent_anc);
-
-		/*
-		 * Only jobacct_gather/cgroup uses prec_extra, and we want to
-		 * make sure we call it once per task, so call it here as we
-		 * iterate through the tasks instead of in get_precs.
-		 */
-		if (callbacks->prec_extra) {
-			if (last_taskid == jobacct->id.taskid) {
-				log_flag(JAG, "skipping prec_extra() call against nodeid:%u taskid:%u",
-					 jobacct->id.nodeid,
-					 jobacct->id.taskid);
+		if (jobacct->pid) {
+			if (!(prec = list_find_first(prec_list, _find_prec,
+						     &jobacct->pid)))
 				continue;
-			} else {
-				log_flag(JAG, "calling prec_extra() call against nodeid:%u taskid:%u",
-					 jobacct->id.nodeid,
-					 jobacct->id.taskid);
+			/*
+			 * We can't use the prec from the list as we need to
+			 * keep it in the original state without offspring since
+			 * we reuse this list keeping around precs after they
+			 * end.
+			 */
+			memcpy(&tmp_prec, prec, sizeof(*prec));
+			permanent_anc = prec;
+			prec = &tmp_prec;
+
+			if (acct_gather_filesystem_g_get_data(prec->tres_data) <
+			    0) {
+				log_flag(JAG, "problem retrieving filesystem data");
 			}
 
-			last_taskid = jobacct->id.taskid;
-			(*(callbacks->prec_extra))(prec, jobacct->id.taskid);
+			if (acct_gather_interconnect_g_get_data(
+				    prec->tres_data) < 0) {
+				log_flag(JAG, "problem retrieving interconnect data");
+			}
+			/* find all my descendents */
+			if (callbacks->get_offspring_data)
+				(*(callbacks->get_offspring_data))(
+					prec_list, prec, prec->pid,
+					permanent_anc);
+
+			/*
+			 * Only jobacct_gather/cgroup uses prec_extra, and we
+			 * want to make sure we call it once per task, so call
+			 * it here as we iterate through the tasks instead of
+			 * in get_precs.
+			 */
+			if (callbacks->prec_extra) {
+				if (last_taskid == jobacct->id.taskid) {
+					log_flag(JAG, "skipping prec_extra() call against nodeid:%u taskid:%u",
+						 jobacct->id.nodeid,
+						 jobacct->id.taskid);
+					continue;
+				} else {
+					log_flag(JAG, "calling prec_extra() call against nodeid:%u taskid:%u",
+						 jobacct->id.nodeid,
+						 jobacct->id.taskid);
+				}
+
+				last_taskid = jobacct->id.taskid;
+				(*(callbacks->prec_extra))(prec,
+							   jobacct->id.taskid);
+			}
+
+			log_flag(JAG, "pid:%u ppid:%u %s:%" PRIu64 " B",
+				 prec->pid, prec->ppid,
+				 (xstrcasestr(slurm_conf.job_acct_gather_params,
+					      "UsePss") ?  "pss" : "rss"),
+				 prec->tres_data[TRES_ARRAY_MEM].size_read);
+
+			last_total_cputime =
+				(double) jobacct->
+				tres_usage_in_tot[TRES_ARRAY_CPU];
+
+			cpu_calc =
+				(prec->ssec + prec->usec) / (double) conv_units;
+
+			/*
+			 * Since we are not storing things as a double anymor
+			 * make it bigger so we don't loose precision.
+			 */
+			cpu_calc *= CPU_TIME_ADJ;
+
+			prec->tres_data[TRES_ARRAY_CPU].size_read =
+				(uint64_t) cpu_calc;
+		} else {
+			prec = xmalloc(sizeof(jag_prec_t));
+			prec->tres_count = jobacct->tres_count;
+			prec->tres_data = xcalloc(prec->tres_count,
+						  sizeof(acct_gather_data_t));
+			_init_tres(prec, NULL);
+			cpu_calc = last_total_cputime = 0;
 		}
-
-		log_flag(JAG, "pid:%u ppid:%u %s:%" PRIu64 " B",
-			 prec->pid, prec->ppid,
-			 (xstrcasestr(slurm_conf.job_acct_gather_params,
-				      "UsePss") ?  "pss" : "rss"),
-			 prec->tres_data[TRES_ARRAY_MEM].size_read);
-
-
-		last_total_cputime =
-			(double)jobacct->tres_usage_in_tot[TRES_ARRAY_CPU];
-
-		cpu_calc = (prec->ssec + prec->usec) / (double) conv_units;
-
-		/*
-		 * Since we are not storing things as a double anymore make it
-		 * bigger so we don't loose precision.
-		 */
-		cpu_calc *= CPU_TIME_ADJ;
-
-		prec->tres_data[TRES_ARRAY_CPU].size_read = (uint64_t)cpu_calc;
 
 		/* get energy consumption
 		 * only once is enough since we
@@ -1239,8 +1252,12 @@ extern void jag_common_poll_data(list_t *task_list, uint64_t cont_id,
 				prec->tres_data[i].size_write;
 		}
 
-		total_job_mem += jobacct->tres_usage_in_tot[TRES_ARRAY_MEM];
-		total_job_vsize += jobacct->tres_usage_in_tot[TRES_ARRAY_VMEM];
+		if (jobacct->pid) {
+			total_job_mem +=
+				jobacct->tres_usage_in_tot[TRES_ARRAY_MEM];
+			total_job_vsize +=
+				jobacct->tres_usage_in_tot[TRES_ARRAY_VMEM];
+		}
 
 		/* Update the cpu times */
 		jobacct->user_cpu_sec = (uint64_t)(prec->usec /
@@ -1294,6 +1311,8 @@ extern void jag_common_poll_data(list_t *task_list, uint64_t cont_id,
 
 			jobacct->last_time = jobacct->cur_time;
 		}
+		if (!jobacct->pid)
+			destroy_jag_prec(prec);
 	}
 	list_iterator_destroy(itr);
 

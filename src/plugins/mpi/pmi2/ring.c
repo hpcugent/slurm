@@ -139,7 +139,7 @@ static pmix_ring_msg* pmix_ring_msgs = NULL;
  * pmix_ring_children */
 static int pmix_ring_count = 0;
 
-/* tracks number of chilren we have for pmix_ring operation
+/* tracks number of children we have for pmix_ring operation
  * (sum of application children and stepd children) */
 static int pmix_ring_children = 0;
 
@@ -230,9 +230,7 @@ static int pmix_stepd_send(const char* buf, uint32_t size, int rank)
 		retries++;
 		if (retries >= MAX_RETRIES) {
 			/* cancel the step to avoid tasks hang */
-			slurm_kill_job_step(job_info.step_id.job_id,
-					    job_info.step_id.step_id,
-					    SIGKILL, 0);
+			slurm_kill_job_step(&job_info.step_id, SIGKILL, 0);
 		}
 
 		/* didn't succeeded, but we'll retry again,

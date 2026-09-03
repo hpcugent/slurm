@@ -86,6 +86,7 @@ enum {
 	LONG_OPT_COMPLETE_FLAG,
 	LONG_OPT_COMMENT,
 	LONG_OPT_COMPRESS,
+	LONG_OPT_CONSOLIDATE_SEGMENTS,
 	LONG_OPT_CONTAINER,
 	LONG_OPT_CONTAINER_ID,
 	LONG_OPT_CONTEXT,
@@ -104,6 +105,7 @@ enum {
 	LONG_OPT_EXCLUSIVE,
 	LONG_OPT_EXPORT,
 	LONG_OPT_EXPORT_FILE,
+	LONG_OPT_EXTERNAL,
 	LONG_OPT_EXTERNAL_LAUNCHER,
 	LONG_OPT_EXTRA,
 	LONG_OPT_GET_USER_ENV,
@@ -166,6 +168,7 @@ enum {
 	LONG_OPT_REBOOT,
 	LONG_OPT_REQUEUE,
 	LONG_OPT_RESERVATION,
+	LONG_OPT_RESOURCES,
 	LONG_OPT_RESV_PORTS,
 	LONG_OPT_SEGMENT_SIZE,
 	LONG_OPT_SEND_LIBS,
@@ -173,6 +176,7 @@ enum {
 	LONG_OPT_SLURMD_DEBUG,
 	LONG_OPT_SOCKETSPERNODE,
 	LONG_OPT_SPREAD_JOB,
+	LONG_OPT_SPREAD_SEGMENTS,
 	LONG_OPT_STEPMGR,
 	LONG_OPT_SWITCH_REQ,
 	LONG_OPT_SWITCH_WAIT,
@@ -193,6 +197,7 @@ enum {
 	LONG_OPT_USAGE,
 	LONG_OPT_USE_MIN_NODES,
 	LONG_OPT_WAIT_ALL_NODES,
+	LONG_OPT_WAIT_FOR_CHILDREN,
 	LONG_OPT_WCKEY,
 	LONG_OPT_WHOLE,
 	LONG_OPT_WRAP,
@@ -287,6 +292,7 @@ typedef struct {
 	uint16_t tree_width;		/* --treewidth			*/
 	bool unbuffered;		/* --unbuffered			*/
 	bool whole;			/* --whole			*/
+	bool wait_for_children; /* --wait-for-children		*/
 } srun_opt_t;
 
 typedef struct {
@@ -401,10 +407,10 @@ typedef struct {
 	char *extra;			/* --extra			*/
 	uint16_t mail_type;		/* --mail-type			*/
 	char *mail_user;		/* --mail-user			*/
-	int get_user_env_time;		/* --get-user-env[=timeout]	*/
-	int get_user_env_mode;		/* --get-user-env=[S|L]		*/
+	bool get_user_env;		/* --get-user-env		*/
 	char *wckey;			/* workload characterization key */
 	char *reservation;		/* --reservation		*/
+	char *resources; /* --resources	*/
 	int resv_port_cnt;		/* --resv_ports			*/
 	int req_switch;			/* min number of switches	*/
 	int wait4switch;		/* max time to wait for min switches */
@@ -458,6 +464,9 @@ typedef struct {
  */
 extern bool slurm_option_get_tres_per_tres(
 	char *in_val, char *tres_name, uint64_t *cnt, char **save_ptr, int *rc);
+
+/* Get cpus per task count from tres per task string */
+extern uint16_t slurm_opt_get_tres_per_task_cpu_cnt(char *tres_per_task);
 
 extern struct option *slurm_option_table_create(slurm_opt_t *opt,
 						char **opt_string);
@@ -548,7 +557,7 @@ extern bool slurm_option_get_next_set(slurm_opt_t *opt, char **name,
 				      char **value, size_t *state);
 
 /*
- * Validate that conflicting optons (--hint, --ntasks-per-core,
+ * Validate that conflicting options (--hint, --ntasks-per-core,
  * --nthreads-per-core, --cpu-bind [for srun]) are not used together.
  *
  */

@@ -40,6 +40,7 @@
 
 #include "src/sacctmgr/sacctmgr.h"
 #include "src/common/macros.h"
+#include "src/common/parse_value.h"
 #include "src/common/slurmdbd_defs.h"
 #include "src/interfaces/auth.h"
 #include "src/common/slurm_protocol_defs.h"
@@ -50,6 +51,7 @@
 static bool warn_needed = false;
 static pthread_mutex_t warn_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t warn_cond = PTHREAD_COND_INITIALIZER;
+static pthread_t notice_thread_handler = 0;
 
 static void *_print_lock_warn(void *no_data)
 {
@@ -91,26 +93,54 @@ static void _nonblock(int state)
 
 }
 
-extern int parse_option_end(char *option)
+/*
+ * IN option - string to parse as /<command>([-+]=<value>)?/
+ * OUT op_type - Set to the type of operator parsed, '-', '+', or 0.
+ * OUT command_len - The strlen of <command>
+ * returns the offset of <value> if it exists, otherwise 0
+ */
+extern int parse_option_end(char *option, int *op_type, int *command_len)
 {
+	xassert(op_type);
+	xassert(command_len);
+
 	int end = 0;
+	*op_type = 0;
+	*command_len = 0;
 
 	if (!option)
 		return 0;
 
-	while(option[end]) {
-		if ((option[end] == '=')
-		   || (option[end] == '+' && option[end+1] == '=')
-		   || (option[end] == '-' && option[end+1] == '='))
-			break;
+	while (option[end] && option[end] != '=')
 		end++;
-	}
 
-	if (!option[end])
+	*command_len = end; /* before '=' */
+
+	if (!option[end]) /* no <value> */
 		return 0;
 
-	end++;
+	if (end) {
+		char tmp_type = option[end - 1];
+		if (tmp_type == '+' || tmp_type == '-') {
+			*op_type = tmp_type;
+			*command_len = end - 1; /* before "[+-]=" */
+		}
+	}
+
+	end++; /* past '=' */
 	return end;
+}
+
+extern bool common_verify_option_syntax(char *option, int op_type,
+					bool allow_op)
+{
+	if (op_type && !allow_op) {
+		exit_code = 1;
+		fprintf(stderr, " Invalid operator '%c=' in %s\n", op_type,
+			option);
+		return false;
+	}
+	return true;
 }
 
 /* you need to xfree whatever is sent from here */
@@ -131,6 +161,11 @@ extern char *strip_quotes(char *option, int *increased, bool make_lower)
 		quote = 1;
 		i++;
 	}
+
+	/* skip beginning spaces */
+	while (option[i] && isspace(option[i]))
+		i++;
+
 	start = i;
 
 	while(option[i]) {
@@ -147,6 +182,11 @@ extern char *strip_quotes(char *option, int *increased, bool make_lower)
 
 		i++;
 	}
+
+	/* trim end spaces */
+	while ((i - 1) && option[i - 1] && isspace(option[i - 1]))
+		i--;
+
 	end += i;
 
 	meat = xmalloc((i-start)+1);
@@ -723,11 +763,6 @@ static print_field_t *_get_print_field(char *object)
 		field->name = xstrdup("Reason");
 		field->len = 30;
 		field->print_routine = print_fields_str;
-	} else if (!xstrncasecmp("RGT", object, MAX(command_len, 1))) {
-		field->type = PRINT_RGT;
-		field->name = xstrdup("RGT");
-		field->len = 6;
-		field->print_routine = print_fields_uint;
 	} else if (!xstrncasecmp("RPC", object, MAX(command_len, 1))) {
 		field->type = PRINT_RPC_VERSION;
 		field->name = xstrdup("RPC");
@@ -856,7 +891,7 @@ extern void notice_thread_init(void)
 {
 	slurm_mutex_lock(&warn_mutex);
 	warn_needed = true;
-	slurm_thread_create_detached(_print_lock_warn, NULL);
+	slurm_thread_create(&notice_thread_handler, _print_lock_warn, NULL);
 	slurm_mutex_unlock(&warn_mutex);
 }
 
@@ -866,11 +901,15 @@ extern void notice_thread_fini(void)
 	warn_needed = false;
 	slurm_cond_broadcast(&warn_cond);
 	slurm_mutex_unlock(&warn_mutex);
+
+	if (notice_thread_handler)
+		slurm_thread_join(notice_thread_handler);
 }
 
 extern int commit_check(char *warning)
 {
 	int ans = 0;
+	int input = 0;
 	char c = '\0';
 	int fd = fileno(stdin);
 	fd_set rfds;
@@ -897,14 +936,18 @@ extern int commit_check(char *warning)
 		if ((ans = select(fd+1, &rfds, NULL, NULL, &tv)) <= 0)
 			break;
 
-		c = (char) getchar();
 		printf("\n");
+		if ((input = getchar()) == EOF)
+			break;
+		c = (char) input;
 	}
 	_nonblock(0);
-	if (ans <= 0)
+	if (ans == 0)
 		printf("timeout\n");
 	else if (c == 'Y' || c == 'y')
 		return 1;
+	else if ((ans < 0) || (input < 0))
+		printf("error: %s\n", strerror(errno));
 
 	return 0;
 }
@@ -1468,7 +1511,7 @@ extern int get_uint(char *in_value, uint32_t *out_value, char *type)
 		return SLURM_ERROR;
 	}
 	num = strtol(meat, &ptr, 10);
-	if ((num == 0) && ptr && ptr[0]) {
+	if (ptr && ptr[0]) {
 		error("Invalid value for %s (%s)", type, meat);
 		xfree(meat);
 		return SLURM_ERROR;
@@ -1493,7 +1536,7 @@ extern int get_uint16(char *in_value, uint16_t *out_value, char *type)
 	}
 
 	num = strtol(meat, &ptr, 10);
-	if ((num == 0) && ptr && ptr[0]) {
+	if (ptr && ptr[0]) {
 		error("Invalid value for %s (%s)", type, meat);
 		xfree(meat);
 		return SLURM_ERROR;
@@ -1518,7 +1561,7 @@ extern int get_uint64(char *in_value, uint64_t *out_value, char *type)
 	}
 
 	num = strtoll(meat, &ptr, 10);
-	if ((num == 0) && ptr && ptr[0]) {
+	if (ptr && ptr[0]) {
 		error("Invalid value for %s (%s)", type, meat);
 		xfree(meat);
 		return SLURM_ERROR;
@@ -1534,16 +1577,15 @@ extern int get_uint64(char *in_value, uint64_t *out_value, char *type)
 
 extern int get_double(char *in_value, double *out_value, char *type)
 {
-	char *ptr = NULL, *meat = NULL;
+	char *meat = NULL;
 	double num;
 
 	if (!(meat = strip_quotes(in_value, NULL, 1))) {
 		error("Problem with strip_quotes");
 		return SLURM_ERROR;
 	}
-	num = strtod(meat, &ptr);
-	if ((num == 0) && ptr && ptr[0]) {
-		error("Invalid value for %s (%s)", type, meat);
+
+	if (s_p_handle_double(&num, type, meat)) {
 		xfree(meat);
 		return SLURM_ERROR;
 	}
@@ -1707,7 +1749,8 @@ extern void sacctmgr_print_assoc_limits(slurmdb_assoc_rec_t *assoc)
 		sacctmgr_initialize_g_tres_list();
 		tmp_char = slurmdb_make_tres_string_from_simple(
 			assoc->grp_tres, g_tres_list, NO_VAL,
-			CONVERT_NUM_UNIT_EXACT, 0, NULL);
+			CONVERT_NUM_UNIT_EXACT, TRES_STR_FLAG_ALLOW_AMEND,
+			NULL);
 		printf("  GrpTRES       = %s\n", tmp_char);
 		xfree(tmp_char);
 	}
@@ -1715,7 +1758,8 @@ extern void sacctmgr_print_assoc_limits(slurmdb_assoc_rec_t *assoc)
 		sacctmgr_initialize_g_tres_list();
 		tmp_char = slurmdb_make_tres_string_from_simple(
 			assoc->grp_tres_mins, g_tres_list, NO_VAL,
-			CONVERT_NUM_UNIT_EXACT, 0, NULL);;
+			CONVERT_NUM_UNIT_EXACT, TRES_STR_FLAG_ALLOW_AMEND,
+			NULL);
 		printf("  GrpTRESMins   = %s\n", tmp_char);
 		xfree(tmp_char);
 	}
@@ -1723,7 +1767,8 @@ extern void sacctmgr_print_assoc_limits(slurmdb_assoc_rec_t *assoc)
 		sacctmgr_initialize_g_tres_list();
 		tmp_char = slurmdb_make_tres_string_from_simple(
 			assoc->grp_tres_run_mins, g_tres_list, NO_VAL,
-			CONVERT_NUM_UNIT_EXACT, 0, NULL);
+			CONVERT_NUM_UNIT_EXACT, TRES_STR_FLAG_ALLOW_AMEND,
+			NULL);
 		printf("  GrpTRESRunMins= %s\n", tmp_char);
 		xfree(tmp_char);
 	}
@@ -1757,7 +1802,8 @@ extern void sacctmgr_print_assoc_limits(slurmdb_assoc_rec_t *assoc)
 		sacctmgr_initialize_g_tres_list();
 		tmp_char = slurmdb_make_tres_string_from_simple(
 			assoc->max_tres_pj, g_tres_list, NO_VAL,
-			CONVERT_NUM_UNIT_EXACT, 0, NULL);
+			CONVERT_NUM_UNIT_EXACT, TRES_STR_FLAG_ALLOW_AMEND,
+			NULL);
 		printf("  MaxTRES       = %s\n", tmp_char);
 		xfree(tmp_char);
 	}
@@ -1765,7 +1811,8 @@ extern void sacctmgr_print_assoc_limits(slurmdb_assoc_rec_t *assoc)
 		sacctmgr_initialize_g_tres_list();
 		tmp_char = slurmdb_make_tres_string_from_simple(
 			assoc->max_tres_pn, g_tres_list, NO_VAL,
-			CONVERT_NUM_UNIT_EXACT, 0, NULL);
+			CONVERT_NUM_UNIT_EXACT, TRES_STR_FLAG_ALLOW_AMEND,
+			NULL);
 		printf("  MaxTRESPerNode= %s\n", tmp_char);
 		xfree(tmp_char);
 	}
@@ -1773,7 +1820,8 @@ extern void sacctmgr_print_assoc_limits(slurmdb_assoc_rec_t *assoc)
 		sacctmgr_initialize_g_tres_list();
 		tmp_char = slurmdb_make_tres_string_from_simple(
 			assoc->max_tres_mins_pj, g_tres_list, NO_VAL,
-			CONVERT_NUM_UNIT_EXACT, 0, NULL);
+			CONVERT_NUM_UNIT_EXACT, TRES_STR_FLAG_ALLOW_AMEND,
+			NULL);
 		printf("  MaxTRESMins   = %s\n", tmp_char);
 		xfree(tmp_char);
 	}
@@ -1781,7 +1829,8 @@ extern void sacctmgr_print_assoc_limits(slurmdb_assoc_rec_t *assoc)
 		sacctmgr_initialize_g_tres_list();
 		tmp_char = slurmdb_make_tres_string_from_simple(
 			assoc->max_tres_run_mins, g_tres_list, NO_VAL,
-			CONVERT_NUM_UNIT_EXACT, 0, NULL);
+			CONVERT_NUM_UNIT_EXACT, TRES_STR_FLAG_ALLOW_AMEND,
+			NULL);
 		printf("  MaxTRESRUNMins= %s\n", tmp_char);
 		xfree(tmp_char);
 	}

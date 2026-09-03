@@ -84,7 +84,7 @@ typedef struct {
 
 extern int jobacct_storage_p_job_heavy(void *db_conn, job_record_t *job_ptr);
 
-static int _sending_script_env(void *x, void *args)
+static int _sending_script_env(void *x, void *arg)
 {
 	dbd_id_rc_msg_t *id_ptr = x;
 	job_record_t *job_ptr;
@@ -693,7 +693,7 @@ static void *_agent(void *x)
 	slurm_mutex_unlock(&agent_lock);
 
 	list_req.msg_type = DBD_SEND_MULT_MSG;
-	list_req.conn = slurmdbd_conn;
+	list_req.pcon = slurmdbd_conn;
 	list_req.data = &list_msg;
 	memset(&list_msg, 0, sizeof(dbd_list_msg_t));
 
@@ -711,11 +711,11 @@ static void *_agent(void *x)
 		}
 
 		START_TIMER;
-		if ((slurmdbd_conn->fd < 0) &&
+		if (!slurmdbd_conn->conn &&
 		    (difftime(time(NULL), fail_time) >= 10)) {
 			/* The connection to Slurm DBD is not open */
 			dbd_conn_check_and_reopen(slurmdbd_conn);
-			if (slurmdbd_conn->fd < 0) {
+			if (!slurmdbd_conn->conn) {
 				fail_time = time(NULL);
 
 				log_flag(DBD_AGENT, "slurmdbd disconnected with agent_count=%d",
@@ -725,7 +725,7 @@ static void *_agent(void *x)
 
 		slurm_mutex_lock(&agent_lock);
 		cnt = list_count(agent_list);
-		if ((cnt == 0) || (slurmdbd_conn->fd < 0) ||
+		if ((cnt == 0) || !slurmdbd_conn->conn ||
 		    (fail_time && (difftime(time(NULL), fail_time) < 10))) {
 			slurm_mutex_unlock(&slurmdbd_lock);
 			_max_dbd_msg_action(&cnt);
@@ -769,7 +769,7 @@ static void *_agent(void *x)
 			slurm_mutex_unlock(&slurmdbd_lock);
 
 			slurm_mutex_lock(&assoc_cache_mutex);
-			if (slurmdbd_conn->fd >= 0 &&
+			if (slurmdbd_conn->conn &&
 			    (running_cache != RUNNING_CACHE_STATE_NOTRUNNING))
 				slurm_cond_signal(&assoc_cache_cond);
 			slurm_mutex_unlock(&assoc_cache_mutex);
@@ -810,7 +810,7 @@ static void *_agent(void *x)
 		}
 		slurm_mutex_unlock(&slurmdbd_lock);
 		slurm_mutex_lock(&assoc_cache_mutex);
-		if (slurmdbd_conn->fd >= 0 &&
+		if (slurmdbd_conn->conn &&
 		    (running_cache != RUNNING_CACHE_STATE_NOTRUNNING))
 			slurm_cond_signal(&assoc_cache_cond);
 		slurm_mutex_unlock(&assoc_cache_mutex);
@@ -853,12 +853,17 @@ static void *_agent(void *x)
 	}
 
 	slurm_mutex_lock(&agent_lock);
-	_save_dbd_state();
 
 	log_flag(AGENT, "slurmdbd agent ending with agent_count=%d",
 		 list_count(agent_list));
 
-	FREE_NULL_LIST(agent_list);
+	/*
+	 * Leave agent_list alive (and unsaved) here so any in-flight RPC
+	 * handlers that race past _close_acct_storage_conn() can still
+	 * enqueue. The list is saved to dbd.messages and freed in
+	 * slurmdbd_agent_fini() once conmgr has been quiesced and no
+	 * more enqueues can happen.
+	 */
 	agent_running = false;
 	slurm_cond_signal(&shutdown_cond);
 	slurm_mutex_unlock(&agent_lock);
@@ -935,6 +940,23 @@ extern void slurmdbd_agent_rem_conn(void)
 	slurm_mutex_unlock(&slurmdbd_lock);
 }
 
+extern void slurmdbd_agent_fini(void)
+{
+	slurm_mutex_lock(&agent_lock);
+	if (agent_list) {
+		/*
+		 * Save anything still queued. This catches both messages
+		 * the agent thread didn't drain before exit and late
+		 * writers (in-flight RPC handlers, conmgr workers,
+		 * slurmscriptd callbacks, etc.) that enqueued after the
+		 * agent thread exited. They are picked up on the next
+		 * slurmctld start.
+		 */
+		_save_dbd_state();
+		FREE_NULL_LIST(agent_list);
+	}
+	slurm_mutex_unlock(&agent_lock);
+}
 
 extern int slurmdbd_agent_send_recv(uint16_t rpc_version,
 				    persist_msg_t *req,
@@ -961,10 +983,10 @@ extern int slurmdbd_agent_send_recv(uint16_t rpc_version,
 		return ESLURM_DB_CONNECTION_INVALID;
 	}
 
-	if (req->conn && (req->conn != slurmdbd_conn))
+	if (req->pcon && (req->pcon != slurmdbd_conn))
 		error("We are overriding the connection!!!!!");
 
-	req->conn = slurmdbd_conn;
+	req->pcon = slurmdbd_conn;
 
 	rc = dbd_conn_send_recv_direct(rpc_version, req, resp);
 
@@ -983,27 +1005,42 @@ extern int slurmdbd_agent_send(uint16_t rpc_version, persist_msg_t *req)
 	buf_t *buffer;
 	uint32_t cnt, rc = SLURM_SUCCESS;
 	static time_t syslog_time = 0;
+	bool trigger_dbd_fail = false, trigger_acct_full = false;
 
 	xassert(running_in_slurmctld());
 	xassert(slurm_conf.max_dbd_msgs);
 
-	log_flag(PROTOCOL, "msg_type:%s protocol_version:%hu agent_count:%d",
+	log_flag(PROTOCOL, "msg_type:%s agent_count:%d",
 		 slurmdbd_msg_type_2_str(req->msg_type, 1),
-		 rpc_version, list_count(agent_list));
+		 list_count(agent_list));
 
-	buffer = slurm_persist_msg_pack(
-		slurmdbd_conn, (persist_msg_t *)req);
+	buffer = pack_slurmdbd_msg(req, SLURM_PROTOCOL_VERSION);
 	if (!buffer)	/* pack error */
 		return SLURM_ERROR;
 
 	slurm_mutex_lock(&agent_lock);
-	if ((agent_tid == 0) || (agent_list == NULL)) {
-		_create_agent();
+	if (!slurmdbd_shutdown) {
 		if ((agent_tid == 0) || (agent_list == NULL)) {
-			slurm_mutex_unlock(&agent_lock);
-			FREE_NULL_BUFFER(buffer);
-			return SLURM_ERROR;
+			_create_agent();
+			if ((agent_tid == 0) || (agent_list == NULL)) {
+				slurm_mutex_unlock(&agent_lock);
+				FREE_NULL_BUFFER(buffer);
+				return SLURM_ERROR;
+			}
 		}
+	}
+	if (!agent_list) {
+		/*
+		 * slurmdbd_agent_fini() has already torn down the queue;
+		 * the message has nowhere to go. Log so operators can see
+		 * late-shutdown drops if they occur.
+		 */
+		debug("%s: dropping %s msg, agent queue already torn down",
+		      __func__,
+		      slurmdbd_msg_type_2_str(req->msg_type, 1));
+		slurm_mutex_unlock(&agent_lock);
+		FREE_NULL_BUFFER(buffer);
+		return SLURM_ERROR;
 	}
 	cnt = list_count(agent_list);
 	if ((cnt >= (slurm_conf.max_dbd_msgs / 2)) &&
@@ -1013,7 +1050,7 @@ extern int slurmdbd_agent_send(uint16_t rpc_version, persist_msg_t *req)
 		error("agent queue filling (%u), MaxDBDMsgs=%u, RESTART SLURMDBD NOW",
 		      cnt, slurm_conf.max_dbd_msgs);
 		syslog(LOG_CRIT, "*** RESTART SLURMDBD NOW ***");
-		(slurmdbd_conn->trigger_callbacks.dbd_fail)();
+		trigger_dbd_fail = true;
 	}
 
 	/* Handle action */
@@ -1026,20 +1063,37 @@ extern int slurmdbd_agent_send(uint16_t rpc_version, persist_msg_t *req)
 		      cnt,
 		      slurmdbd_msg_type_2_str(req->msg_type, 1),
 		      req->msg_type);
-		(slurmdbd_conn->trigger_callbacks.acct_full)();
+		trigger_acct_full = true;
 		FREE_NULL_BUFFER(buffer);
 		rc = SLURM_ERROR;
 	}
 
 	slurm_cond_broadcast(&agent_cond);
 	slurm_mutex_unlock(&agent_lock);
+
+	/*
+	 * Trigger callbacks after dropping agent_lock to avoid the
+	 * agent_lock -> slurmdbd_lock inversion against _agent(), which
+	 * takes those locks in the opposite order.
+	 */
+	if (trigger_acct_full || trigger_dbd_fail) {
+		slurm_mutex_lock(&slurmdbd_lock);
+		if (slurmdbd_conn) {
+			if (trigger_dbd_fail)
+				(slurmdbd_conn->trigger_callbacks.dbd_fail)();
+			if (trigger_acct_full)
+				(slurmdbd_conn->trigger_callbacks.acct_full)();
+		}
+		slurm_mutex_unlock(&slurmdbd_lock);
+	}
+
 	return rc;
 }
 
 /* Return true if connection to slurmdbd is active, false otherwise. */
 extern bool slurmdbd_conn_active(void)
 {
-	if (!slurmdbd_conn || (slurmdbd_conn->fd < 0))
+	if (!slurmdbd_conn || !slurmdbd_conn->conn)
 		return false;
 
 	return true;

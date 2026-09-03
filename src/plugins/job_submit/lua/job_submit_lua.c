@@ -131,7 +131,7 @@ static char *_get_default_account(uint32_t user_id)
 	memset(&user, 0, sizeof(slurmdb_user_rec_t));
 	user.uid = user_id;
 	if (assoc_mgr_fill_in_user(acct_db_conn, &user, accounting_enforce,
-				   NULL, false) != SLURM_ERROR) {
+				   NULL, false) == SLURM_SUCCESS) {
 		return user.default_acct;
 	} else {
 		return NULL;
@@ -163,7 +163,7 @@ static char *_get_default_qos(uint32_t user_id, char *account, char *partition)
 	slurmdb_qos_rec_t qos;
 	uint32_t qos_id = 0;
 
-	if (_fill_assoc(user_id, account, partition, &assoc) != SLURM_ERROR)
+	if (_fill_assoc(user_id, account, partition, &assoc) == SLURM_SUCCESS)
 		qos_id = assoc.def_qos_id;
 
 	if (!qos_id)
@@ -171,8 +171,8 @@ static char *_get_default_qos(uint32_t user_id, char *account, char *partition)
 
 	memset(&qos, 0, sizeof(slurmdb_qos_rec_t));
 	qos.id = qos_id;
-	if (assoc_mgr_fill_in_qos(acct_db_conn, &qos, accounting_enforce,
-				  NULL, false) != SLURM_ERROR) {
+	if (assoc_mgr_fill_in_qos(acct_db_conn, &qos, accounting_enforce, NULL,
+				  false) == SLURM_SUCCESS) {
 		return qos.name;
 	} else {
 		return NULL;
@@ -188,7 +188,7 @@ static int _qos_id_to_qos_name(void *x, void *arg)
 	qos.id = atoi(qos_id);
 
 	if (assoc_mgr_fill_in_qos(acct_db_conn, &qos, accounting_enforce, NULL,
-				  false) == SLURM_ERROR) {
+				  false) != SLURM_SUCCESS) {
 		return 0;
 	}
 
@@ -203,11 +203,16 @@ static char *_get_assoc_qos(uint32_t user_id, char *account, char *partition)
 	slurmdb_assoc_rec_t assoc;
 	list_t *qos_name_list;
 	char *qos_name_list_str;
+	list_t *qos_list = NULL;
 
-	_fill_assoc(user_id, account, partition, &assoc);
+	if (_fill_assoc(user_id, account, partition, &assoc) == SLURM_SUCCESS)
+		qos_list = assoc.qos_list;
+
+	if (!qos_list)
+		return NULL;
 
 	qos_name_list = list_create(xfree_ptr);
-	list_for_each_ro(assoc.qos_list, _qos_id_to_qos_name, qos_name_list);
+	list_for_each_ro(qos_list, _qos_id_to_qos_name, qos_name_list);
 
 	qos_name_list_str = slurm_char_list_to_xstr(qos_name_list);
 
@@ -223,7 +228,7 @@ static char *_get_assoc_comment(uint32_t user_id, char *account,
 	slurmdb_assoc_rec_t assoc;
 	char *comment = NULL;
 
-	if (_fill_assoc(user_id, account, partition, &assoc) != SLURM_ERROR)
+	if (_fill_assoc(user_id, account, partition, &assoc) == SLURM_SUCCESS)
 		comment = assoc.comment;
 
 	return comment;
@@ -576,6 +581,10 @@ static int _get_job_req_field(const job_desc_msg_t *job_desc, const char *name)
 		lua_pushstring(L, job_desc->container);
 	} else if (!xstrcmp(name, "contiguous")) {
 		lua_pushnumber(L, job_desc->contiguous);
+	} else if (!xstrcmp(name, "core_spec") &&
+		   (job_desc->core_spec != NO_VAL16) &&
+		   !(job_desc->core_spec & CORE_SPEC_THREAD)) {
+		lua_pushnumber(L, job_desc->core_spec);
 	} else if (!xstrcmp(name, "cores_per_socket")) {
 		lua_pushnumber(L, job_desc->cores_per_socket);
 	} else if (!xstrcmp(name, "cpu_freq_min")) {
@@ -648,6 +657,11 @@ static int _get_job_req_field(const job_desc_msg_t *job_desc, const char *name)
 	} else if (!xstrcmp(name, "network")) {
 		lua_pushstring(L, job_desc->network);
 	} else if (!xstrcmp(name, "nice")) {
+		/*
+		 * nice will be NO_VAL when unset or offset by NICE_OFFSET.
+		 * Decrement nice by NICE_OFFSET in job_submit.lua if the value
+		 * needs to be human readable.
+		 */
 		lua_pushnumber(L, job_desc->nice);
 	} else if (!xstrcmp(name, "ntasks_per_board")) {
 		lua_pushnumber(L, job_desc->ntasks_per_board);
@@ -699,6 +713,8 @@ static int _get_job_req_field(const job_desc_msg_t *job_desc, const char *name)
 		lua_pushstring(L, job_desc->reservation);
 	} else if (!xstrcmp(name, "script")) {
 		lua_pushstring(L, job_desc->script);
+	} else if (!xstrcmp(name, "segment_size")) {
+		lua_pushnumber(L, job_desc->segment_size);
 	} else if (!xstrcmp(name, "shared") ||
 		   !xstrcmp(name, "oversubscribe")) {
 		lua_pushnumber(L, job_desc->shared);
@@ -738,6 +754,10 @@ static int _get_job_req_field(const job_desc_msg_t *job_desc, const char *name)
 		lua_pushstring(L, job_desc->std_in);
 	} else if (!xstrcmp(name, "std_out")) {
 		lua_pushstring(L, job_desc->std_out);
+	} else if (!xstrcmp(name, "thread_spec") &&
+		   (job_desc->core_spec != NO_VAL16) &&
+		   (job_desc->core_spec & CORE_SPEC_THREAD)) {
+		lua_pushnumber(L, (job_desc->core_spec & ~CORE_SPEC_THREAD));
 	} else if (!xstrcmp(name, "threads_per_core")) {
 		lua_pushnumber(L, job_desc->threads_per_core);
 	} else if (!xstrcmp(name, "time_limit")) {
@@ -867,6 +887,8 @@ static int _set_job_req_field(lua_State *L)
 			job_desc->container = xstrdup(value_str);
 	} else if (!xstrcmp(name, "contiguous")) {
 		job_desc->contiguous = luaL_checknumber(L, 3);
+	} else if (!xstrcmp(name, "core_spec")) {
+		job_desc->core_spec = luaL_checknumber(L, 3);
 	} else if (!xstrcmp(name, "cores_per_socket")) {
 		job_desc->cores_per_socket = luaL_checknumber(L, 3);
 	} else if (!xstrcmp(name, "cpu_freq_min")) {
@@ -956,6 +978,10 @@ static int _set_job_req_field(lua_State *L)
 		if (strlen(value_str))
 			job_desc->name = xstrdup(value_str);
 	} else if (!xstrcmp(name, "nice")) {
+		/*
+		 * nice should be NO_VAL when unset or incremented by
+		 * NICE_OFFSET by the job_submit.lua script.
+		 */
 		job_desc->nice = luaL_checknumber(L, 3);
 	} else if (!xstrcmp(name, "ntasks_per_gpu")) {
 		job_desc->ntasks_per_tres = luaL_checknumber(L, 3);
@@ -1015,6 +1041,8 @@ static int _set_job_req_field(lua_State *L)
 		xfree(job_desc->script);
 		if (strlen(value_str))
 			job_desc->script = xstrdup(value_str);
+	} else if (!xstrcmp(name, "segment_size")) {
+		job_desc->segment_size = luaL_checknumber(L, 3);
 	} else if (!xstrcmp(name, "selinux_context")) {
 		value_str = luaL_checkstring(L, 3);
 		xfree(job_desc->selinux_context);
@@ -1045,6 +1073,9 @@ static int _set_job_req_field(lua_State *L)
 		xfree(job_desc->std_out);
 		if (strlen(value_str))
 			job_desc->std_out = xstrdup(value_str);
+	} else if (!xstrcmp(name, "thread_spec")) {
+		job_desc->core_spec = luaL_checknumber(L, 3);
+		job_desc->core_spec |= CORE_SPEC_THREAD;
 	} else if (!xstrcmp(name, "threads_per_core")) {
 		job_desc->threads_per_core = luaL_checknumber(L, 3);
 	} else if (!xstrcmp(name, "time_limit")) {
@@ -1333,21 +1364,7 @@ static const struct luaL_Reg slurm_functions [] = {
 
 static void _register_local_output_functions(lua_State *L)
 {
-	char *unpack_str;
-	char tmp_string[100];
-
-#if LUA_VERSION_NUM == 501
-	unpack_str = "unpack";
-#else
-	unpack_str = "table.unpack";
-#endif
-
 	slurm_lua_table_register(L, NULL, slurm_functions);
-	snprintf(tmp_string, sizeof(tmp_string),
-		 "slurm.user_msg (string.format(%s({...})))",
-		 unpack_str);
-	luaL_loadstring(L, tmp_string);
-	lua_setfield(L, -2, "log_user");
 
 	/* Must be always done after we register the slurm_functions */
 	lua_setglobal(L, "slurm");
@@ -1384,7 +1401,7 @@ static void _loadscript_extra(lua_State *st)
  *   let alone called from multiple threads. Therefore, locking
  *   is unnecessary here.
  */
-int init(void)
+extern int init(void)
 {
 	int rc = SLURM_SUCCESS;
 
@@ -1395,10 +1412,10 @@ int init(void)
 	return slurm_lua_loadscript(&L, "job_submit/lua",
 				    lua_script_path, req_fxns,
 				    &lua_script_last_loaded,
-				    _loadscript_extra);
+				    _loadscript_extra, NULL);
 }
 
-int fini(void)
+extern void fini(void)
 {
 	if (L) {
 		debug3("%s: Unloading Lua script", __func__);
@@ -1409,8 +1426,6 @@ int fini(void)
 	xfree(lua_script_path);
 
 	slurm_lua_fini();
-
-	return SLURM_SUCCESS;
 }
 
 
@@ -1423,7 +1438,8 @@ extern int job_submit(job_desc_msg_t *job_desc, uint32_t submit_uid,
 
 	rc = slurm_lua_loadscript(&L, "job_submit/lua",
 				  lua_script_path, req_fxns,
-				  &lua_script_last_loaded, _loadscript_extra);
+				  &lua_script_last_loaded, _loadscript_extra,
+				  NULL);
 
 	if (rc != SLURM_SUCCESS)
 		goto out;
@@ -1477,9 +1493,10 @@ extern int job_modify(job_desc_msg_t *job_desc, job_record_t *job_ptr,
 
 	rc = slurm_lua_loadscript(&L, "job_submit/lua",
 				  lua_script_path, req_fxns,
-				  &lua_script_last_loaded, _loadscript_extra);
+				  &lua_script_last_loaded, _loadscript_extra,
+				  NULL);
 
-	if (rc == SLURM_ERROR)
+	if (rc != SLURM_SUCCESS)
 		goto out;
 
 	/*

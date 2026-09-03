@@ -195,12 +195,12 @@ static int _get_task_count(job_record_t *job_ptr)
 	 * originally calculate off min_nodes if ntasks_per_node is given we
 	 * will not have the right num_tasks, so recalculate.
 	 */
-	if (job_ptr->details->num_tasks &&
-	    (job_ptr->bit_flags & JOB_NTASKS_SET)) {
-		maxtasks = job_ptr->details->num_tasks;
-	} else if (job_ptr->details->ntasks_per_node) {
+	if (job_ptr->details->ntasks_per_node) {
 		maxtasks = job_ptr->details->ntasks_per_node *
 			   job_ptr->job_resrcs->nhosts;
+	} else if (job_ptr->details->num_tasks &&
+		   (job_ptr->bit_flags & JOB_NTASKS_SET)) {
+		maxtasks = job_ptr->details->num_tasks;
 	} else {
 		maxtasks = job_ptr->job_resrcs->ncpus;
 		if (job_ptr->details->cpus_per_task > 1)
@@ -274,7 +274,7 @@ static int _set_task_dist_internal(job_record_t *job_ptr)
 		}
 	}
 
-	/* Distrubute remaining tasks per plane size */
+	/* Distribute remaining tasks per plane size */
 	while (maxtasks > tid) {
 		uint32_t last_tid = tid;
 		for (n = 0; n < job_res->nhosts; n++) {
@@ -314,7 +314,7 @@ static int _set_task_dist(job_record_t *job_ptr, const uint16_t cr_type)
 	 */
 	if (job_ptr->job_resrcs &&
 	    (job_ptr->details->mc_ptr->threads_per_core != NO_VAL16) &&
-	    ((cr_type & CR_CORE) || (cr_type & CR_SOCKET))) {
+	    ((cr_type & SELECT_CORE) || (cr_type & SELECT_SOCKET))) {
 		job_resources_t *job_res = job_ptr->job_resrcs;
 		node_record_t *node_ptr;
 		int i = 0;
@@ -339,7 +339,7 @@ static int _compute_plane_dist(job_record_t *job_ptr, uint32_t *gres_task_limit,
 			       uint32_t *gres_min_cpus)
 {
 	bool do_gres_min_cpus = false;
-	uint32_t n, i, p, tid, maxtasks, l;
+	uint32_t n, p, tid, maxtasks, l;
 	uint16_t *avail_cpus, plane_size = 1;
 	job_resources_t *job_res = job_ptr->job_resrcs;
 	bool test_tres_tasks = true;
@@ -363,7 +363,8 @@ static int _compute_plane_dist(job_record_t *job_ptr, uint32_t *gres_task_limit,
 
 	job_res->cpus = xcalloc(job_res->nhosts, sizeof(uint16_t));
 	job_res->tasks_per_node = xcalloc(job_res->nhosts, sizeof(uint16_t));
-	for (tid = 0, i = 0; (tid < maxtasks); i++) { /* cycle counter */
+	tid = 0;
+	while (tid < maxtasks) {
 		bool space_remaining = false;
 		for (n = 0; ((n < job_res->nhosts) && (tid < maxtasks)); n++) {
 			bool more_tres_tasks = false;
@@ -486,9 +487,9 @@ static void _block_sync_core_bitmap(job_record_t *job_ptr,
 	} else
 		return;
 
-	if (cr_type & CR_SOCKET)
+	if (cr_type & SELECT_SOCKET)
 		alloc_sockets = true;
-	else if (cr_type & CR_CORE)
+	else if (cr_type & SELECT_CORE)
 		alloc_cores = true;
 
 	if (job_ptr->details->mc_ptr) {
@@ -532,7 +533,7 @@ static void _block_sync_core_bitmap(job_record_t *job_ptr,
 		if ((ntasks_per_core == 1) &&
 		    (cpus_per_task > vpus)) {
 			/* how many cores a task will consume */
-			int cores_per_task = (cpus_per_task + vpus - 1) / vpus;
+			int cores_per_task = ROUNDUP(cpus_per_task, vpus);
 			int tasks = cpus / cpus_per_task;
 			req_cores = tasks * cores_per_task;
 		}
@@ -874,10 +875,9 @@ static int _cyclic_sync_core_bitmap(job_record_t *job_ptr,
 	sock_end   = xcalloc(sock_size, sizeof(uint32_t));
 	sock_used  = xcalloc(sock_size, sizeof(bool));
 
-
-	if (cr_type & CR_SOCKET)
+	if (cr_type & SELECT_SOCKET)
 		alloc_sockets = true;
-	else if (cr_type & CR_CORE)
+	else if (cr_type & SELECT_CORE)
 		alloc_cores = true;
 
 	core_map = job_res->core_bitmap;
@@ -1427,7 +1427,7 @@ extern int dist_tasks(job_record_t *job_ptr, const uint16_t cr_type,
 	 * now sync up the core_bitmap with the job_resources_t struct
 	 * based on the given distribution AND resource setting
 	 */
-	if (!(cr_type & CR_CORE) && !(cr_type & CR_SOCKET)) {
+	if (!(cr_type & SELECT_CORE) && !(cr_type & SELECT_SOCKET)) {
 		_block_sync_core_bitmap(job_ptr, cr_type);
 		return SLURM_SUCCESS;
 	}
@@ -1439,7 +1439,7 @@ extern int dist_tasks(job_record_t *job_ptr, const uint16_t cr_type,
 	 * Note : cyclic cores distribution, which is the default, is treated
 	 * by the next code block
 	 */
-	if (slurm_conf.select_type_param & CR_CORE_DEFAULT_DIST_BLOCK) {
+	if (slurm_conf.select_type_param & SELECT_CORE_DEFAULT_DIST_BLOCK) {
 		switch (job_ptr->details->task_dist & SLURM_DIST_NODESOCKMASK) {
 		case SLURM_DIST_ARBITRARY:
 		case SLURM_DIST_BLOCK:

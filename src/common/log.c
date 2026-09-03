@@ -73,6 +73,7 @@
 #include "src/common/fd.h"
 #include "src/common/log.h"
 #include "src/common/macros.h"
+#include "src/common/sluid.h"
 #include "src/common/slurm_protocol_api.h"
 #include "src/common/slurm_time.h"
 #include "src/common/xmalloc.h"
@@ -138,8 +139,6 @@ typedef struct {
 	bool initialized;
 	uint16_t fmt;            /* Flag for specifying timestamp format */
 }	log_t;
-
-char *slurm_prog_name = NULL;
 
 /* static variables */
 static pthread_mutex_t  log_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -310,6 +309,11 @@ _log_init(char *prog, log_options_t opt, log_facility_t fac, char *logfile )
 		atfork_install_handlers();
 	}
 
+	if (syslog_open) {
+		closelog();
+		syslog_open = false;
+	}
+
 	if (prog) {
 		if (log->argv0)
 			xfree(log->argv0);
@@ -322,10 +326,6 @@ _log_init(char *prog, log_options_t opt, log_facility_t fac, char *logfile )
 			short_name = default_name;
 		log->argv0 = xstrdup(short_name);
 	}
-
-	/* Only take the first one here.  In some situations it can change. */
-	if (!slurm_prog_name && log->argv0 && (strlen(log->argv0) > 0))
-		slurm_prog_name = xstrdup(log->argv0);
 
 	if (!log->prefix)
 		log->prefix = xstrdup("");
@@ -344,11 +344,6 @@ _log_init(char *prog, log_options_t opt, log_facility_t fac, char *logfile )
 	if (log->opt.buffered) {
 		log->buf  = cbuf_create(128, 8192);
 		log->fbuf = cbuf_create(128, 8192);
-	}
-
-	if (syslog_open) {
-		closelog();
-		syslog_open = false;
 	}
 
 	if (log->opt.syslog_level > LOG_LEVEL_QUIET) {
@@ -528,6 +523,10 @@ void log_fini(void)
 
 	slurm_mutex_lock(&log_lock);
 	_log_flush(log);
+	if (syslog_open) {
+		closelog();
+		syslog_open = false;
+	}
 	xfree(log->argv0);
 	xfree(log->prefix);
 	if (log->buf)
@@ -536,12 +535,7 @@ void log_fini(void)
 		cbuf_destroy(log->fbuf);
 	if (log->logfp)
 		fclose(log->logfp);
-	if (syslog_open) {
-		closelog();
-		syslog_open = false;
-	}
 	xfree(log);
-	xfree(slurm_prog_name);
 	slurm_mutex_unlock(&log_lock);
 }
 
@@ -585,6 +579,10 @@ void log_set_prefix(char **prefix)
 void log_set_argv0(char *argv0)
 {
 	slurm_mutex_lock(&log_lock);
+	if (syslog_open) {
+		closelog();
+		syslog_open = false;
+	}
 	if (log->argv0)
 		xfree(log->argv0);
 	if (!argv0)
@@ -884,6 +882,7 @@ extern char *vxstrfmt(const char *fmt, va_list ap)
 				case 'A':
 				case 'd':
 				case 'D':
+				case 'I':
 				case 'J':
 				case 's':
 				case 'S':
@@ -981,6 +980,30 @@ extern char *vxstrfmt(const char *fmt, va_list ap)
 						&intermediate_pos,
 						_print_data_t(
 							d,
+							substitute_on_stack,
+							sizeof(substitute_on_stack)));
+					va_end(ap_copy);
+					break;
+				}
+				/*
+				 * "%pI" => "JobID=... SLUID=..." on a
+				 * slurm_step_id_t
+				 */
+				case 'I':
+				{
+					void *ptr = NULL;
+					slurm_step_id_t *step_id = NULL;
+					va_list ap_copy;
+
+					va_copy(ap_copy, ap);
+					for (int i = 0; i < cnt; i++)
+						ptr = va_arg(ap_copy, void *);
+					step_id = ptr;
+					xstrcatat(
+						intermediate_fmt,
+						&intermediate_pos,
+						log_build_job_id_str(
+							step_id,
 							substitute_on_stack,
 							sizeof(substitute_on_stack)));
 					va_end(ap_copy);
@@ -1091,7 +1114,7 @@ extern char *vxstrfmt(const char *fmt, va_list ap)
 					xiso8601timecat(substitute, true);
 					break;
 				}
-				switch (log->fmt & (~LOG_FMT_FORMAT_STDERR)) {
+				switch (log->fmt) {
 				case LOG_FMT_ISO8601_MS:
 					/* "%M" => "yyyy-mm-ddThh:mm:ss.fff"  */
 					xiso8601timecat(substitute, true);
@@ -1392,25 +1415,14 @@ static void _log_msg(log_level_t level, bool sched, bool spank, bool warn,
 		fflush(stdout);
 		if (spank) {
 			_log_printf(log, log->buf, stderr, "%s%s", buf, eol);
-		} else if (log->fmt == LOG_FMT_THREAD_ID) {
-			/*
-			 * This is for backward compatibility. In versions
-			 * < 23.11 this was the only way to print to stderr.
-			 * Keep this behavior since LogTimeFormat=format_stderr
-			 * results in a little bit different format.
-			 */
-			char tmp[64];
-			_set_idbuf(tmp, sizeof(tmp));
-			_log_printf(log, log->buf, stderr, "%s: %s%s%s",
-			            tmp, pfx, buf, eol);
-		} else if ((log->fmt & LOG_FMT_FORMAT_STDERR)) {
-			xlogfmtcat(&msgbuf, "[%M] %s", pfx);
-			_log_printf(log, log->buf, stderr, "%s%s%s",
-				    msgbuf, buf, eol);
+		} else if (running_in_daemon()) {
+			xlogfmtcat(&msgbuf, "[%M]");
+			_log_printf(log, log->buf, stderr, "%s %s%s%s", msgbuf,
+				    pfx, buf, eol);
 			xfree(msgbuf);
 		} else {
 			_log_printf(log, log->buf, stderr, "%s: %s%s%s",
-			            log->argv0, pfx, buf, eol);
+				    log->argv0, pfx, buf, eol);
 		}
 		fflush(stderr);
 	}
@@ -1447,7 +1459,6 @@ static void _log_msg(log_level_t level, bool sched, bool spank, bool warn,
 
 		xfree(json);
 		fflush(log->logfp);
-		xfree(msgbuf);
 	} else {
 		xassert(log->opt.logfile_fmt == LOG_FILE_FMT_TIMESTAMP);
 		xlogfmtcat(&msgbuf, "[%M] %s%s", log->prefix, pfx);
@@ -1461,11 +1472,8 @@ static void _log_msg(log_level_t level, bool sched, bool spank, bool warn,
 
 		/* Avoid changing errno if syslog fails */
 		int orig_errno = errno;
-		xlogfmtcat(&msgbuf, "%s%s%s", log->prefix, pfx, buf);
-		syslog(priority, "%.500s", msgbuf);
+		syslog(priority, "%s%s%s", log->prefix, pfx, buf);
 		errno = orig_errno;
-
-		xfree(msgbuf);
 	}
 
 	slurm_mutex_unlock(&log_lock);
@@ -1650,6 +1658,35 @@ extern int get_sched_log_level(void)
 	return MAX(highest_log_level, highest_sched_log_level);
 }
 
+extern char *log_build_job_id_str(slurm_step_id_t *step_id, char *buf,
+				  int buf_size)
+{
+	xassert(buf);
+	xassert(buf_size > 1);
+
+	buf[0] = '\0';
+
+	if (!step_id) {
+		snprintf(buf, buf_size, "%%.0sJobId=Invalid SLUID=Invalid");
+	} else if (step_id->job_id && (step_id->job_id != NO_VAL) &&
+		   !step_id->sluid) {
+		snprintf(buf, buf_size, "%%.0sJobId=%u", step_id->job_id);
+	} else if (step_id->job_id && (step_id->job_id != NO_VAL)) {
+		int pos = snprintf(buf, buf_size,
+				   "%%.0sJobId=%u SLUID=", step_id->job_id);
+		if (pos > 0)
+			print_sluid(step_id->sluid, buf + pos, buf_size - pos);
+	} else if (step_id->sluid) {
+		int pos = snprintf(buf, buf_size, "%%.0sSLUID=");
+		if (pos > 0)
+			print_sluid(step_id->sluid, buf + pos, buf_size - pos);
+	} else {
+		snprintf(buf, buf_size, "%%.0sJobId=Invalid SLUID=Invalid");
+	}
+
+	return buf;
+}
+
 /*
  * log_build_step_id_str() - print a slurm_step_id_t as " StepId=...", with
  * Batch and Extern used as appropriate.
@@ -1751,4 +1788,45 @@ extern void _log_flag_hex(const void *data, size_t len, ssize_t start,
 	}
 
 	xfree(prepend);
+}
+
+log_closeall_skip_t log_closeall_pre(void)
+{
+	log_closeall_skip_t skip = {
+		.log_fd = -1,
+		.sched_log_fd = -1,
+	};
+
+	slurm_mutex_lock(&log_lock);
+
+	if (log && log->logfp)
+		skip.log_fd = fileno(log->logfp);
+	else
+		skip.log_fd = fileno(stderr);
+
+	if (sched_log && sched_log->logfp)
+		skip.sched_log_fd = fileno(sched_log->logfp);
+
+	closelog();
+	syslog_open = false;
+
+	slurm_mutex_unlock(&log_lock);
+
+	return skip;
+}
+
+void log_closeall_post(void)
+{
+	slurm_mutex_lock(&log_lock);
+
+	/*
+	 * Re-open syslog file descriptor after closeall() with same settings
+	 * if logging had already been initialized.
+	 */
+	if (log && log->initialized) {
+		openlog(log->argv0, LOG_PID, log->facility);
+		syslog_open = true;
+	}
+
+	slurm_mutex_unlock(&log_lock);
 }

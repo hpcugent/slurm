@@ -35,8 +35,8 @@
 #define _SLURM_JOB_RECORD_H
 
 #include "src/common/cron.h"
+#include "src/common/dynamic_plugin_data.h"
 #include "src/common/extra_constraints.h"
-#include "src/common/front_end.h"
 #include "src/common/part_record.h"
 #include "src/common/slurm_protocol_defs.h"
 
@@ -47,6 +47,13 @@ typedef struct slurmctld_resv slurmctld_resv_t;
 
 extern time_t last_job_update;	/* time of last update to job records */
 extern list_t *purge_files_list; /* list of job ids to purge files of */
+
+#define STEP_ID_FROM_JOB_RECORD(job_ptr) \
+	(slurm_step_id_t) \
+	{ \
+		.job_id = job_ptr->job_id, .sluid = job_ptr->step_id.sluid, \
+		.step_id = NO_VAL, .step_het_comp = NO_VAL, \
+	}
 
 #define DETAILS_MAGIC	0xdea84e7
 #define JOB_MAGIC	0xf0b7392c
@@ -160,6 +167,7 @@ typedef struct {
 	char *req_nodes;		/* required nodes */
 	uint16_t requeue;		/* controls ability requeue job */
 	uint16_t resv_port_cnt;		/* count of MPI ports reserved per node */
+	char *resv_req;			/* original requested reservations */
 	uint16_t segment_size;
 	uint8_t share_res;		/* set if job can share resources with
 					 * other jobs */
@@ -242,12 +250,28 @@ typedef struct {
  */
 typedef struct job_record job_record_t;
 struct job_record {
-	uint32_t magic;			/* magic cookie for data integrity */
-					/* DO NOT ALPHABETIZE */
+	/*
+	 * DO NOT REORDER THE STEP_ID.
+	 * Having it at the start of the struct allows job_ptr to be cast
+	 * as slurm_step_id_t. This is (ab)used in the logging code to make
+	 * %pI and %pJ interchangeable.
+	 */
+	slurm_step_id_t step_id;
+	/*
+	 * The magic value would usually be at the start of the struct, but
+	 * in this specific struct it has to come second.
+	 */
+	uint32_t magic;
+
+	/* "Normal" structure definition starts here: */
+
 	char    *account;		/* account number to charge */
 	char    *admin_comment;		/* administrator's arbitrary comment */
 	char	*alias_list;		/* node name to address aliases */
 	char    *alloc_node;		/* local node making resource alloc */
+	char *alloc_tls_cert;		/* TLS certificate for client that is
+					 * getting/has allocation
+					 * (srun, salloc,etc.) */
 	uint16_t alloc_resp_port;	/* RESPONSE_RESOURCE_ALLOCATION port */
 	uint32_t alloc_sid;		/* local sid making resource alloc */
 	uint32_t array_job_id;		/* job_id of a job array or 0 if N/A */
@@ -293,6 +317,7 @@ struct job_record {
 					 * state, this is time suspend began */
 	time_t end_time_exp;		/* when we believe the job is
 					   going to end. */
+	uint16_t epilog_failed;		/* true if any Epilog failed */
 	bool epilog_running;		/* true of EpilogSlurmctld is running */
 	uint32_t exit_code;		/* exit code for job (status from
 					 * wait call) */
@@ -304,8 +329,6 @@ struct job_record {
 					 * this job to be killed.
 					 * NULL in all other situations */
 	job_fed_details_t *fed_details;	/* details for federated jobs. */
-	front_end_record_t *front_end_ptr; /* Pointer to front-end node running
-					 * this job */
 	list_t *gres_list_req;		/* Requested generic resource allocation
 					   detail */
 	list_t *gres_list_req_accum;	/* Requested generic resource allocation
@@ -327,11 +350,13 @@ struct job_record {
 	uint32_t het_job_offset;	/* HetJob component index */
 	list_t *het_job_list;		/* List of job pointers to all
 					 * components */
+	void *hres_select; /* DON'T PACK. */
 	uint32_t job_id;		/* job ID */
 	identity_t *id;			/* job identity */
 	job_record_t *job_next;		/* next entry with same hash index */
 	job_record_t *job_array_next_j;	/* job array linked list by job_id */
 	job_record_t *job_array_next_t;	/* job array linked list by task_id */
+	job_record_t *job_next_sluid; /* next entry with same sluid hash */
 	job_record_t *job_preempt_comp; /* het job preempt component */
 	job_resources_t *job_resrcs;	/* details of allocated cores */
 	uint32_t job_state;		/* state of the job */
@@ -339,7 +364,11 @@ struct job_record {
 					 * node failure */
 	time_t last_sched_eval;		/* last time job was evaluated for scheduling */
 	char *licenses;			/* licenses required by the job */
-	list_t *license_list;		/* structure with license info */
+	char *licenses_allocated;	/* licenses allocated to the job */
+	list_t *license_list;		/* structure with license info; when
+					 * the job is allocated, this list is
+					 * changed to match "licenses_allocated"
+					 */
 	list_t *licenses_to_preempt;    /* list of licenses the job will look
 					   for in its preemptee candidates
 					   Don't pack, don't save it's only used
@@ -416,7 +445,7 @@ struct job_record {
 					 * service record used for
 					 * this job, confirm the
 					 * value before use */
-	void *qos_blocking_ptr;		/* internal use only, DON'T PACK */
+	slurmdb_qos_rec_t *qos_blocking_ptr; /* internal use only, DON'T PACK */
 	uint8_t reboot;			/* node reboot requested before start */
 	uint16_t restart_cnt;		/* count of restarts */
 	time_t resize_time;		/* time of latest size change */
@@ -432,7 +461,6 @@ struct job_record {
 	uint32_t requid;	    	/* requester user ID */
 	char *resp_host;		/* host for srun communications */
 	char *sched_nodes;		/* list of nodes scheduled for job */
-	dynamic_plugin_data_t *select_jobinfo;/* opaque data, BlueGene */
 	char *selinux_context;		/* SELinux context */
 	uint32_t site_factor;		/* factor to consider in priority */
 	char **spank_job_env;		/* environment variables for job prolog
@@ -462,6 +490,10 @@ struct job_record {
 	uint32_t time_min;		/* minimum time_limit minutes or
 					 * INFINITE,
 					 * zero implies same as time_limit */
+	dynamic_plugin_data_t *topo_jobinfo; /* topology plugin job info
+					      * available after eval_nodes is
+					      * successfully run on this job.
+					      */
 	time_t tot_sus_time;		/* total time in suspend state */
 	uint32_t total_cpus;		/* number of allocated cpus,
 					 * for accounting */
@@ -535,13 +567,14 @@ typedef struct depend_spec {
 	uint32_t        depend_time;    /* time to wait (mins) */
 	uint32_t	job_id;		/* Slurm job_id */
 	job_record_t   *job_ptr;	/* pointer to this job */
+	uint32_t parsed_array_task_id; /* Unmodified array task id */
 	uint64_t 	singleton_bits; /* which clusters have satisfied the
 					   singleton dependency */
 } depend_spec_t;
 
 /* Used as the mode for update_node_active_features() */
 typedef enum {
-	FEATURE_MODE_IND,  /* Print each node change indivually */
+	FEATURE_MODE_IND,  /* Print each node change individually */
 	FEATURE_MODE_COMB, /* Try to combine like changes */
 	FEATURE_MODE_PEND, /* Print any pending change message */
 } feature_mode_t;
@@ -588,6 +621,7 @@ typedef struct {
 					 * real memory per CPU | MEM_PER_CPU,
 					 * default=0 (use job limit) */
 	uint16_t port;			/* port for srun communications */
+	char *alloc_tls_cert;
 	time_t pre_sus_time;		/* time step ran prior to last suspend */
 	uint16_t start_protocol_ver;	/* Slurm version step was
 					 * started with either srun
@@ -599,7 +633,6 @@ typedef struct {
 	uint32_t requid;	    	/* requester user ID */
 	time_t start_time;		/* step allocation start time */
 	uint32_t time_limit;	  	/* step allocation time limit */
-	dynamic_plugin_data_t *select_jobinfo;/* opaque data, BlueGene */
 	uint32_t srun_pid;		/* PID of srun (also see host/port) */
 	uint32_t state;			/* state of the step. See job_states */
 	slurm_step_id_t step_id;	/* step number */
@@ -607,6 +640,10 @@ typedef struct {
 					  * in the step */
 	bitstr_t *step_node_bitmap;	/* bitmap of nodes allocated to job
 					 * step */
+	char *cwd;			/* path derived from cwd or --chdir */
+	char *std_err;			/* pathname of step's stderr file */
+	char *std_in;			/* pathname of step's stdin file */
+	char *std_out;			/* pathname of step's stdout file */
 /*	time_t suspend_time;		 * time step last suspended or resumed
 					 * implicitly the same as suspend_time
 					 * in the job record */
@@ -697,7 +734,8 @@ extern int dump_job_step_state(void *x, void *arg);
 extern int load_step_state(job_record_t *job_ptr, buf_t *buffer,
 			   uint16_t protocol_version);
 
-extern int job_record_calc_arbitrary_tpn(job_record_t *job_ptr);
+extern int job_record_calc_arbitrary_tpn(job_record_t *job_ptr,
+					 uint16_t protocol_version);
 
 extern void job_record_pack_details_common(
 	job_details_t *detail_ptr, buf_t *buffer, uint16_t protocol_version);
@@ -766,6 +804,11 @@ extern void update_job_limit_set_tres(uint16_t **tres_limits, int tres_cnt);
 /*
  * Set a new sluid on the job_ptr
  */
-extern void job_record_set_sluid(job_record_t *job_ptr);
+extern void job_record_set_sluid(job_record_t *job_ptr, bool requeue);
+
+/*
+ * Allocate and initialize multicore data block
+ */
+extern multi_core_data_t *job_record_create_mc(void);
 
 #endif /* _SLURM_JOB_RECORD_H */

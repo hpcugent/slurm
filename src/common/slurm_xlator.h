@@ -87,7 +87,6 @@
 #define	bit_set_count		slurm_bit_set_count
 #define	bit_set_count_range	slurm_bit_set_count_range
 #define	bit_clear_count		slurm_bit_clear_count
-#define	bit_nset_max_count	slurm_bit_nset_max_count
 #define	bit_rotate_copy		slurm_bit_rotate_copy
 #define	bit_rotate		slurm_bit_rotate
 #define	bit_fmt			slurm_bit_fmt
@@ -106,9 +105,6 @@
 #define	bit_copy		slurm_bit_copy
 #define	bit_equal		slurm_bit_equal
 #define	bit_pick_cnt		slurm_bit_pick_cnt
-#define bit_nffc		slurm_bit_nffc
-#define bit_noc			slurm_bit_noc
-#define bit_nffs		slurm_bit_nffs
 #define bit_copybits		slurm_bit_copybits
 #define	bit_get_bit_num		slurm_bit_get_bit_num
 
@@ -118,6 +114,7 @@
 #define fd_set_blocking		slurm_fd_set_blocking
 #define fd_set_nonblocking	slurm_fd_set_nonblocking
 #define fd_get_socket_error	slurm_fd_get_socket_error
+#define fd_get_readable_bytes slurm_fd_get_readable_bytes
 #define send_fd_over_socket	slurm_send_fd_over_socket
 #define receive_fd_over_socket	slurm_receive_fd_over_socket
 #define rmdir_recursive		slurm_rmdir_recursive
@@ -125,6 +122,7 @@
 /* hostlist.[ch] functions */
 #define	hostlist_create_dims	slurm_hostlist_create_dims
 #define	hostlist_create		slurm_hostlist_create
+#define	hostlist_create_client	slurm_hostlist_create_client
 #define	hostlist_copy		slurm_hostlist_copy
 #define	hostlist_count		slurm_hostlist_count
 #define	hostlist_delete		slurm_hostlist_delete
@@ -160,6 +158,8 @@
 #define	hostlist_shift		slurm_hostlist_shift
 #define	hostlist_shift_dims	slurm_hostlist_shift_dims
 #define	hostlist_sort		slurm_hostlist_sort
+#define	hostlist_split_treewidth \
+				slurm_hostlist_split_treewidth
 #define	hostlist_cmp_first	slurm_hostlist_cmp_first
 #define	hostlist_uniq		slurm_hostlist_uniq
 #define	hostset_count		slurm_hostset_count
@@ -343,15 +343,7 @@
 #define add_key_pair_own	slurm_add_key_pair_own
 
 /* run_in_daemon.[ch] functions */
-#define run_in_daemon           slurm_run_in_daemon
-#define running_in_daemon	slurm_running_in_daemon
-#define running_in_sackd        slurm_running_in_sackd
-#define running_in_slurmctld    slurm_running_in_slurmctld
-#define running_in_slurmd       slurm_running_in_slurmd
-#define running_in_slurmdbd     slurm_running_in_slurmdbd
-#define running_in_slurmd_stepd slurm_running_in_slurmd_stepd
-#define running_in_slurmrestd	slurm_running_in_slurmrestd
-#define running_in_slurmstepd   slurm_running_in_slurmstepd
+#define run_in_daemon slurm_run_in_daemon
 
 /* slurm_auth.[ch] functions
  * None exported today.
@@ -532,6 +524,7 @@
 #define stepd_gethostbyname		slurm_stepd_gethostbyname
 #define xfree_struct_hostent		slurm_xfree_struct_hostent
 #define stepd_get_namespace_fd		slurm_stepd_get_namespace_fd
+#define stepd_get_namespace_fds slurm_stepd_get_namespace_fds
 
 /* cgroup.[ch] functions */
 #define cgroup_conf_init		slurm_cgroup_conf_init
@@ -540,6 +533,7 @@
 
 /* topology.[ch] functions */
 #define topology_g_build_config slurm_topology_g_build_config
+#define topology_g_destroy_config slurm_topology_g_destroy_config
 
 /* job_state_reason.[ch] functions */
 #define job_state_reason_string	slurm_job_state_reason_string
@@ -547,10 +541,34 @@
 #define job_state_reason_check slurm_job_state_reason_check
 
 /* serializer.[ch] functions */
+#define serializer_required slurm_serializer_required
 #define serializer_g_init slurm_serializer_g_init
 #define serialize_g_data_to_string slurm_serialize_g_data_to_string
 #define serialize_g_string_to_data slurm_serialize_g_string_to_data
 #define serializer_g_fini slurm_serializer_g_fini
+
+/* certgen.[ch] functions */
+#define certgen_g_init slurm_certgen_g_init
+#define certgen_g_fini slurm_certgen_g_fini
+#define certgen_g_self_signed slurm_certgen_g_self_signed
+
+/* fetch_config.[ch] functions */
+#define dump_to_memfd slurm_dump_to_memfd
+
+/* run_command.[ch] functions */
+#define run_command slurm_run_command
+
+/* http_parser.[ch] functions */
+#define http_parser_g_init slurm_http_parser_g_init
+#define http_parser_g_fini slurm_http_parser_g_fini
+#define http_parser_g_new_parse_request slurm_http_parser_g_new_parse_request
+#define http_parser_g_free_parse_request slurm_http_parser_g_free_parse_request
+#define http_parser_g_parse_request slurm_http_parser_g_parse_request
+
+/* url_parser.[ch] functions */
+#define url_parser_g_init slurm_url_parser_g_init
+#define url_parser_g_fini slurm_url_parser_g_fini
+#define url_parser_g_parse slurm_url_parser_g_parse
 
 #endif /* USE_ALIAS */
 

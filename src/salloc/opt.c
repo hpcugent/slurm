@@ -190,6 +190,7 @@ env_vars_t env_vars[] = {
   { "SALLOC_CLUSTER_CONSTRAINT", LONG_OPT_CLUSTER_CONSTRAINT },
   { "SALLOC_CLUSTERS", 'M' },
   { "SLURM_CLUSTERS", 'M' },
+  { "SALLOC_CONSOLIDATE_SEGMENTS", LONG_OPT_CONSOLIDATE_SEGMENTS },
   { "SALLOC_CONTAINER", LONG_OPT_CONTAINER },
   { "SALLOC_CONTAINER_ID", LONG_OPT_CONTAINER_ID },
   { "SALLOC_CONSTRAINT", 'C' },
@@ -225,8 +226,10 @@ env_vars_t env_vars[] = {
   { "SALLOC_QOS", 'q' },
   { "SALLOC_REQ_SWITCH", LONG_OPT_SWITCH_REQ },
   { "SALLOC_RESERVATION", LONG_OPT_RESERVATION },
+  { "SALLOC_SEGMENT_SIZE", LONG_OPT_SEGMENT_SIZE },
   { "SALLOC_SIGNAL", LONG_OPT_SIGNAL },
   { "SALLOC_SPREAD_JOB", LONG_OPT_SPREAD_JOB },
+  { "SALLOC_SPREAD_SEGMENTS", LONG_OPT_SPREAD_SEGMENTS },
   { "SALLOC_THREAD_SPEC", LONG_OPT_THREAD_SPEC },
   { "SALLOC_THREADS_PER_CORE", LONG_OPT_THREADSPERCORE },
   { "SALLOC_TIMELIMIT", 't' },
@@ -595,10 +598,6 @@ static bool _opt_verify(void)
 		}
 		xfree(tmp);
 	}
-	if (opt.mem_bind_type && (getenv("SLURM_MEM_BIND_SORT") == NULL) &&
-	    (opt.mem_bind_type & MEM_BIND_SORT)) {
-		setenvf(NULL, "SLURM_MEM_BIND_SORT", "sort");
-	}
 
 	if (opt.mem_bind_type && (getenv("SLURM_MEM_BIND_VERBOSE") == NULL)) {
 		if (opt.mem_bind_type & MEM_BIND_VERBOSE) {
@@ -784,6 +783,7 @@ static void _usage(void)
 "              [--account=name] [--dependency=type:jobid[+time]] [--comment=name]\n"
 "              [--mail-type=type] [--mail-user=user] [--nice[=value]]\n"
 "              [--bell] [--no-bell] [--kill-command[=signal]] [--spread-job]\n"
+"              [--spread-segments]\n"
 "              [--nodefile=file] [--nodelist=hosts] [--exclude=hosts]\n"
 "              [--network=type] [--mem-per-cpu=MB] [--qos=qos]\n"
 "              [--mem-bind=...] [--reservation=name] [--mcs-label=mcs]\n"
@@ -824,7 +824,7 @@ static void _help(void)
 "                              this deadline (start > (deadline - time[-min]))\n"
 "  -D, --chdir=path            change working directory\n"
 "      --get-user-env          used by Moab.  See srun man page.\n"
-"      --gres=list             required generic resources\n"
+"      --gres=list             required generic resources per node\n"
 "      --gres-flags=opts       flags related to GRES management\n"
 "  -H, --hold                  submit job in held state\n"
 "  -I, --immediate[=secs]      exit if resources not available in \"secs\"\n"
@@ -861,6 +861,7 @@ static void _help(void)
 "  -s, --oversubscribe         oversubscribe resources with other jobs\n"
 "      --signal=[R:]num[@time] send signal when time limit within time seconds\n"
 "      --spread-job            spread job across as many nodes as possible\n"
+"      --spread-segments       spread job segments across separate base blocks\n"
 "      --switches=max-switches{@max-time-to-wait}\n"
 "                              Optimum switches and max time to wait for optimum\n"
 "  -S, --core-spec=cores       count of reserved cores\n"

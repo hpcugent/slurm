@@ -120,47 +120,45 @@ static const struct luaL_Reg slurm_functions[] = {
  *   let alone called from multiple threads. Therefore, locking
  *   is unnecessary here.
  */
-int init(void)
+extern int init(void)
 {
-        int rc = SLURM_SUCCESS;
+	int rc = SLURM_SUCCESS;
 
-        if ((rc = slurm_lua_init()) != SLURM_SUCCESS)
-                return rc;
-
-	if ((rc = serializer_g_init(MIME_TYPE_JSON_PLUGIN, NULL))) {
-		error("%s: unable to load JSON serializer: %s", __func__,
-		      slurm_strerror(rc));
+	if ((rc = slurm_lua_init()) != SLURM_SUCCESS)
 		return rc;
-	}
+
+	serializer_required(MIME_TYPE_JSON);
 
 	stored_data = xcalloc(24, sizeof(char *));
 	stored_sz = 24;
-	lua_script_path = get_extra_conf_path("cli_filter.lua");
+
+	if (!(lua_script_path = conf_get_opt_str(slurm_conf.cli_filter_params,
+						 "cli_filter_lua_path=")))
+		lua_script_path = get_extra_conf_path("cli_filter.lua");
 
 	return slurm_lua_loadscript(&L, "cli_filter/lua",
 				    lua_script_path, req_fxns,
-				    &lua_script_last_loaded, _loadscript_extra);
+				    &lua_script_last_loaded, _loadscript_extra,
+				    NULL);
 }
 
-int fini(void)
+extern void fini(void)
 {
 	for (int i = 0; i < stored_n; i++)
 		xfree(stored_data[i]);
 	xfree(stored_data);
 	xfree(lua_script_path);
 
-        lua_close(L);
+	lua_close(L);
 
 	slurm_lua_fini();
-
-        return SLURM_SUCCESS;
 }
 
 static int _setup_stringarray(lua_State *st, int limit, char **data) {
 
 	/*
 	 * if limit/data empty this will create an empty array intentionally to
-         * allow the client code to iterate over it
+	 * allow the client code to iterate over it
 	 */
 	lua_newtable(st);
 	for (int i = 0; i < limit && data && data[i]; i++) {
@@ -374,7 +372,7 @@ static int _retrieve_data(lua_State *st)
 
 static void _loadscript_extra(lua_State *st)
 {
-        /* local setup */
+	/* local setup */
 	slurm_lua_table_register(st, NULL, slurm_functions);
 
 	/* Must be always done after we register the slurm_functions */
@@ -387,7 +385,8 @@ extern int cli_filter_p_setup_defaults(slurm_opt_t *opt, bool early)
 
 	rc = slurm_lua_loadscript(&L, "cli_filter/lua",
 				  lua_script_path, req_fxns,
-				  &lua_script_last_loaded, _loadscript_extra);
+				  &lua_script_last_loaded, _loadscript_extra,
+				  NULL);
 
 	if (rc != SLURM_SUCCESS)
 		goto out;
@@ -424,7 +423,8 @@ extern int cli_filter_p_pre_submit(slurm_opt_t *opt, int offset)
 
 	rc = slurm_lua_loadscript(&L, "cli_filter/lua",
 				  lua_script_path, req_fxns,
-				  &lua_script_last_loaded, _loadscript_extra);
+				  &lua_script_last_loaded, _loadscript_extra,
+				  NULL);
 
 	if (rc != SLURM_SUCCESS)
 		goto out;
@@ -468,7 +468,8 @@ extern void cli_filter_p_post_submit(
 
 	rc = slurm_lua_loadscript(&L, "cli_filter/lua",
 				  lua_script_path, req_fxns,
-				  &lua_script_last_loaded, _loadscript_extra);
+				  &lua_script_last_loaded, _loadscript_extra,
+				  NULL);
 
 	if (rc != SLURM_SUCCESS)
 		goto out;

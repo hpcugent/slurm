@@ -43,7 +43,7 @@ typedef struct gres_stepmgr_step_test_args {
 	uint16_t cpus_per_task; /* IN cpus_per_task - number of CPUs required
 				 * per task */
 	int *err_code; /* OUT err_code - If an error occurred, set this to tell
-			* the caller why the error happend. */
+			* the caller why the error happened. */
 	bool first_step_node; /* IN first_step_node - true if this is node zero
 			       * of the step (do initing) */
 	bool ignore_alloc; /* IN ignore_alloc - if set ignore resources already
@@ -173,7 +173,7 @@ extern void gres_stepmgr_job_merge(
  */
 extern void gres_stepmgr_job_clear_alloc(list_t *job_gres_list);
 
-/* Given a job's GRES data structure, return the indecies for selected elements
+/* Given a job's GRES data structure, return the indices for selected elements
  * IN job_gres_list  - job's allocated GRES data structure
  * IN nodes - list of nodes allocated to job
  * OUT gres_detail_cnt - Number of elements (nodes) in gres_detail_str
@@ -241,7 +241,7 @@ extern void gres_stepmgr_step_test_per_step(
  *                      (do initialization)
  * IN tasks_on_node - number of tasks to be launched on this node
  * IN rem_nodes - desired additional node count to allocate, including this node
- * IN job_id, step_id - ID of the step being allocated.
+ * IN job_ptr, step_id - ID of the step being allocated.
  * IN decr_job_alloc - whether or not to decrement the step allocation from the
  *                     job allocation.
  * OUT step_node_mem_alloc - the amount of memory allocated to the step on this
@@ -252,18 +252,16 @@ extern void gres_stepmgr_step_test_per_step(
  *                          gres allocated to the step on this node
  * RET SLURM_SUCCESS or error code
  */
-extern int gres_stepmgr_step_alloc(
-	list_t *step_gres_list,
-	list_t **step_gres_list_alloc,
-	list_t *job_gres_list,
-	int node_offset, bool first_step_node,
-	uint16_t tasks_on_node, uint32_t rem_nodes,
-	uint32_t job_id, uint32_t step_id,
-	bool decr_job_alloc,
-	uint64_t *step_node_mem_alloc,
-	list_t *node_gres_list,
-	bitstr_t *core_bitmap,
-	int *total_gres_cpu_cnt);
+extern int gres_stepmgr_step_alloc(list_t *step_gres_list,
+				   list_t **step_gres_list_alloc,
+				   list_t *job_gres_list, int node_offset,
+				   bool first_step_node, uint16_t tasks_on_node,
+				   uint32_t rem_nodes, job_record_t *job_ptr,
+				   uint32_t step_id, bool decr_job_alloc,
+				   uint64_t *step_node_mem_alloc,
+				   list_t *node_gres_list,
+				   bitstr_t *core_bitmap,
+				   int *total_gres_cpu_cnt);
 
 /*
  * Deallocate resource to a step and update job and step gres information

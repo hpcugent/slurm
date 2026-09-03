@@ -114,7 +114,7 @@ static char *_get_device_name(unsigned int dev_inx)
 
 	device_name = xmalloc(DEVICE_NAME_SZ);
 
-	if (!fscanf(fp, "%s", device_name))
+	if (!fgets(device_name, DEVICE_NAME_SZ, fp))
 		debug("Could not read Neuron device name");
 	gpu_common_underscorify_tolower(device_name);
 	xfree(sysfs_file);
@@ -244,11 +244,9 @@ extern int init(void)
 	return SLURM_SUCCESS;
 }
 
-extern int fini(void)
+extern void fini(void)
 {
 	debug("%s: unloading %s", __func__, plugin_name);
-
-	return SLURM_SUCCESS;
 }
 
 extern void gpu_p_get_device_count(uint32_t *device_count)

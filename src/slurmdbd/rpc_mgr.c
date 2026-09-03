@@ -44,6 +44,7 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <unistd.h>
 
 #include "src/common/fd.h"
 #include "src/common/log.h"
@@ -69,9 +70,8 @@ static pthread_t       master_thread_id = 0;
 extern void *rpc_mgr(void *no_data)
 {
 	int sockfd, newsockfd;
-	int i;
 	slurm_addr_t cli_addr;
-	slurmdbd_conn_t *conn_arg = NULL;
+	slurmdbd_conn_t *dbd_conn = NULL;
 
 	master_thread_id = pthread_self();
 
@@ -85,38 +85,34 @@ extern void *rpc_mgr(void *no_data)
 	/*
 	 * Process incoming RPCs until told to shutdown
 	 */
-	while (!shutdown_time &&
-	       (i = slurm_persist_conn_wait_for_thread_loc()) >= 0) {
+	while (!shutdown_time) {
 		/*
 		 * accept needed for stream implementation is a no-op in
 		 * message implementation that just passes sockfd to newsockfd
 		 */
-		if ((newsockfd = slurm_accept_msg_conn(sockfd,
-						       &cli_addr)) ==
+		if ((newsockfd = slurm_accept_conn(sockfd, &cli_addr)) ==
 		    SLURM_ERROR) {
-			slurm_persist_conn_free_thread_loc(i);
 			if (errno != EINTR)
-				error("slurm_accept_msg_conn: %m");
+				error("slurm_accept_conn: %m");
 			continue;
 		}
 		fd_set_nonblocking(newsockfd);
 
-		conn_arg = xmalloc(sizeof(slurmdbd_conn_t));
-		conn_arg->conn = xmalloc(sizeof(persist_conn_t));
-		conn_arg->conn->fd = newsockfd;
-		conn_arg->conn->flags = PERSIST_FLAG_DBD;
-		conn_arg->conn->callback_proc = proc_req;
-		conn_arg->conn->callback_fini = _connection_fini_callback;
-		conn_arg->conn->shutdown = &shutdown_time;
-		conn_arg->conn->version = SLURM_MIN_PROTOCOL_VERSION;
-		conn_arg->conn->rem_host = xmalloc(INET6_ADDRSTRLEN);
+		dbd_conn = xmalloc(sizeof(slurmdbd_conn_t));
+		dbd_conn->pcon = xmalloc(sizeof(persist_conn_t));
+		dbd_conn->pcon->flags = PERSIST_FLAG_DBD;
+		dbd_conn->pcon->callback_proc = proc_req;
+		dbd_conn->pcon->callback_fini = _connection_fini_callback;
+		dbd_conn->pcon->shutdown = &shutdown_time;
+		dbd_conn->pcon->version = SLURM_MIN_PROTOCOL_VERSION;
+		dbd_conn->pcon->rem_host = xmalloc(INET6_ADDRSTRLEN);
 		/* Don't fill in the rem_port here.  It will be filled in
 		 * later if it is a slurmctld connection. */
-		slurm_get_ip_str(&cli_addr, conn_arg->conn->rem_host,
+		slurm_get_ip_str(&cli_addr, dbd_conn->pcon->rem_host,
 				 INET6_ADDRSTRLEN);
 
-		slurm_persist_conn_recv_thread_init(
-			conn_arg->conn, i, conn_arg);
+		slurm_persist_conn_recv_thread_init(dbd_conn->pcon, newsockfd,
+						    -1, dbd_conn);
 	}
 
 	debug("rpc_mgr shutting down");
@@ -134,30 +130,72 @@ extern void rpc_mgr_wake(void)
 
 static void _connection_fini_callback(void *arg)
 {
-	slurmdbd_conn_t *conn = (slurmdbd_conn_t *) arg;
+	slurmdbd_conn_t *dbd_conn = (slurmdbd_conn_t *) arg;
 	bool stay_locked = false;
+	int tries = 0;
 
-	slurm_mutex_lock(&conn->conn_send_lock);
-	slurm_persist_conn_destroy(conn->conn_send);
-	conn->conn_send = NULL;
-	slurm_mutex_unlock(&conn->conn_send_lock);
+	/*
+	 * If we are sending updates to this ctld, it is holding
+	 * pcon_send_lock and is in slurm_persist_conn_open() -- either
+	 * still inside connect() (pcon_send->last_fd not yet published)
+	 * or already past it and sitting in poll() on the pcon_send
+	 * socket. The ctld has disconnected (that is why we are here)
+	 * so the socket will never get a reply. Wake the push by
+	 * shutting down the published fd. Clearing PERSIST_FLAG_RECONNECT
+	 * first prevents _slurm_persist_recv_msg() from reopening the
+	 * connection and re-wedging on a fresh fd. The push errors out
+	 * of slurm_persist_conn_open(), releases pcon_send_lock, and we
+	 * proceed with destroy.
+	 *
+	 * Reading pcon_send->last_fd lock-free is safe because it is a
+	 * scalar published by _open_persist_conn() and cleared to -1 by
+	 * _conn_destroy() before the conn struct is freed -- so unlike
+	 * dereferencing pcon_send->conn, this cannot land on a freed
+	 * TLS conn struct.
+	 *
+	 * Loop while we cannot acquire the lock: last_fd is only valid
+	 * once the socket has been created, so during connect() it may
+	 * be -1 for up to a TCP SYN timeout. Re-attempt the shutdown
+	 * each pass so we wake the push as soon as the fd is published.
+	 */
+	if (dbd_conn->pcon_send)
+		dbd_conn->pcon_send->flags &= ~PERSIST_FLAG_RECONNECT;
+	while (pthread_mutex_trylock(&dbd_conn->pcon_send_lock) == EBUSY) {
+		if (dbd_conn->pcon_send) {
+			int fd = dbd_conn->pcon_send->last_fd;
+			if (fd > 0) {
+				debug("Terminating send to the slurmctld on cluster %s. It is restarting or shutting down.",
+				      dbd_conn->pcon->cluster_name);
+				shutdown(fd, SHUT_RDWR);
+			}
+		}
+		if (tries++ >= 100) {
+			slurm_mutex_lock(&dbd_conn->pcon_send_lock);
+			break;
+		}
+		usleep(10000); /* 10ms */
+	}
 
-	if (conn->conn->rem_port) {
+	slurm_persist_conn_destroy(dbd_conn->pcon_send);
+	dbd_conn->pcon_send = NULL;
+	slurm_mutex_unlock(&dbd_conn->pcon_send_lock);
+
+	if (dbd_conn->pcon->rem_port) {
 		if (!shutdown_time) {
 			slurmdb_cluster_rec_t cluster_rec;
 			memset(&cluster_rec, 0, sizeof(slurmdb_cluster_rec_t));
-			cluster_rec.name = conn->conn->cluster_name;
-			cluster_rec.control_host = conn->conn->rem_host;
-			cluster_rec.control_port = conn->conn->rem_port;
-			cluster_rec.rpc_version = conn->conn->version;
-			cluster_rec.tres_str = conn->tres_str;
-			if (conn->conn->flags & PERSIST_FLAG_EXT_DBD)
+			cluster_rec.name = dbd_conn->pcon->cluster_name;
+			cluster_rec.control_host = dbd_conn->pcon->rem_host;
+			cluster_rec.control_port = dbd_conn->pcon->rem_port;
+			cluster_rec.rpc_version = dbd_conn->pcon->version;
+			cluster_rec.tres_str = dbd_conn->tres_str;
+			if (dbd_conn->pcon->flags & PERSIST_FLAG_EXT_DBD)
 				cluster_rec.flags = CLUSTER_FLAG_EXT;
 			debug("cluster %s has disconnected",
-			      conn->conn->cluster_name);
+			      dbd_conn->pcon->cluster_name);
 
 			clusteracct_storage_g_fini_ctld(
-				conn->db_conn, &cluster_rec);
+				dbd_conn->db_conn, &cluster_rec);
 		} else if (slurmdbd_conf->commit_delay)
 			stay_locked = true;
 
@@ -168,21 +206,21 @@ static void _connection_fini_callback(void *arg)
 		 * below.
 		 */
 		slurm_mutex_lock(&registered_lock);
-		list_delete_ptr(registered_clusters, conn);
+		list_delete_ptr(registered_clusters, dbd_conn);
 		if (!stay_locked)
 			slurm_mutex_unlock(&registered_lock);
 
 		/* needs to be the last thing done */
-		acct_storage_g_commit(conn->db_conn, 1);
+		acct_storage_g_commit(dbd_conn->db_conn, 1);
 	}
 
-	acct_storage_g_close_connection(&conn->db_conn);
+	acct_storage_g_close_connection(&dbd_conn->db_conn);
 
 	if (stay_locked)
 		slurm_mutex_unlock(&registered_lock);
 	/* handled directly in the internal persist_conn code */
-	//slurm_persist_conn_members_destroy(&conn->conn);
-	slurm_mutex_destroy(&conn->conn_send_lock);
-	xfree(conn->tres_str);
-	xfree(conn);
+	//slurm_persist_conn_members_destroy(&dbd_conn->pcon);
+	slurm_mutex_destroy(&dbd_conn->pcon_send_lock);
+	xfree(dbd_conn->tres_str);
+	xfree(dbd_conn);
 }

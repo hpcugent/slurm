@@ -39,7 +39,9 @@
 
 #include "src/common/slurm_xlator.h"
 #include "src/common/data.h"
+#include "src/common/http.h"
 #include "src/common/log.h"
+#include "src/common/read_config.h"
 #include "src/common/slurm_protocol_api.h"
 #include "src/common/xassert.h"
 #include "src/common/xmalloc.h"
@@ -80,13 +82,6 @@ const char *mime_types[] = {
 	"application/x-www-form-urlencoded",
 	NULL
 };
-
-static bool _is_char_hex(char buffer)
-{
-	return (buffer >= '0' && buffer <= '9') ||
-	       (buffer >= 'a' && buffer <= 'f') ||
-	       (buffer >= 'A' && buffer <= 'F');
-}
 
 extern int serialize_p_data_to_string(char **dest, size_t *length,
 				      const data_t *src,
@@ -170,39 +165,16 @@ static bool _is_valid_url_char(char buffer)
 	       buffer == '-' || buffer == '.' || buffer == '_';
 }
 
-/*
- * decodes % sequence.
- * IN ptr pointing to % character
- * RET \0 on error or decoded character
- */
-static unsigned char _decode_seq(const char *ptr)
+extern int serialize_p_init(serializer_flags_t flags)
 {
-	if (_is_char_hex(*(ptr + 1)) && _is_char_hex(*(ptr + 2))) {
-		/* using unsigned char to avoid any rollover */
-		unsigned char high = *(ptr + 1);
-		unsigned char low = *(ptr + 2);
-		unsigned char decoded = (slurm_char_to_hex(high) << 4) +
-					slurm_char_to_hex(low);
+	log_flag(DATA, "loaded");
 
-		//TODO: find more invalid characters?
-		if (decoded == '\0') {
-			error("%s: invalid URL escape sequence for 0x00",
-			      __func__);
-			return '\0';
-		} else if (decoded == 0xff) {
-			error("%s: invalid URL escape sequence for 0xff",
-			      __func__);
-			return '\0';
-		}
+	return SLURM_SUCCESS;
+}
 
-		debug5("%s: URL decoded: 0x%c%c -> %c",
-		       __func__, high, low, decoded);
-
-		return decoded;
-	} else {
-		debug("%s: invalid URL escape sequence: %s", __func__, ptr);
-		return '\0';
-	}
+extern void serialize_p_fini(void)
+{
+	log_flag(DATA, "unloaded");
 }
 
 /*
@@ -222,9 +194,11 @@ extern int serialize_p_string_to_data(data_t **dest, const char *src,
 	data_t *d = data_set_dict(data_new());
 	char *key = NULL;
 	char *buffer = NULL;
+	const char *src_end = src + length;
 
 	/* extract each word */
-	for (const char *ptr = src; ptr && !rc && *ptr != '\0'; ++ptr) {
+	for (const char *ptr = src;
+	     ptr && !rc && (ptr < src_end) && (*ptr != '\0'); ++ptr) {
 		if (_is_valid_url_char(*ptr)) {
 			xstrcatchar(buffer, *ptr);
 			continue;
@@ -233,15 +207,15 @@ extern int serialize_p_string_to_data(data_t **dest, const char *src,
 		switch (*ptr) {
 		case '%': /* rfc3986 */
 		{
-			const char c = _decode_seq(ptr);
+			const char c = url_decode_escape_seq(ptr, src_end);
 			if (c != '\0') {
 				/* shift past the hex value */
 				ptr += 2;
 
 				xstrcatchar(buffer, c);
 			} else {
-				debug("%s: invalid URL escape sequence: %s",
-				      __func__, ptr);
+				debug("%s: invalid URL escape sequence: %.*s",
+				      __func__, (int) (src_end - ptr), ptr);
 				rc = SLURM_ERROR;
 				break;
 			}

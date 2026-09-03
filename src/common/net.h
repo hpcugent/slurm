@@ -47,7 +47,7 @@
 
 #include <slurm/slurm.h>
 
-/* open a stream socket on an ephemereal port and put it into
+/* open a stream socket on an ephemeral port and put it into
  * the listen state. fd and port are filled in with the new
  * socket's file descriptor and port #.
  *
@@ -94,5 +94,17 @@ extern char *addrinfo_to_string(const struct addrinfo *addr);
  *	slurm_addr_t.ss_family=AF_UNSPEC if path is not valid
  */
 extern slurm_addr_t sockaddr_from_unix_path(const char *path);
+
+/*
+ * Get socket peer info from the kernel
+ * WARNING: only works for AF_UNIX sockets
+ * IN fd - file descriptor for socket to query
+ * IN/OUT cred_uid - pointer to populate with User ID
+ * IN/OUT cred_gid - pointer to populate with Group ID
+ * IN/OUT cred_pid - pointer to populate with Process ID
+ * RET SLURM_SUCCESS or ESLURM_AUTH_SOCKET_INVALID_PEER or error
+ */
+extern int net_get_peer(int fd, uid_t *cred_uid, gid_t *cred_gid,
+			pid_t *cred_pid);
 
 #endif /* !_NET_H */

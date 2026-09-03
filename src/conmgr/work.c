@@ -33,6 +33,7 @@
  *  51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA.
 \*****************************************************************************/
 
+#include "src/common/events.h"
 #include "src/common/list.h"
 #include "src/common/macros.h"
 #include "src/common/proc_args.h"
@@ -42,9 +43,18 @@
 
 #include "src/conmgr/conmgr.h"
 #include "src/conmgr/delayed.h"
-#include "src/conmgr/events.h"
 #include "src/conmgr/mgr.h"
 #include "src/conmgr/signals.h"
+
+#define CTIME_STR_LEN 72
+
+#define MAGIC_LOG_WORK_ARGS 0xbaF9100a
+
+typedef struct {
+	int magic; /* MAGIC_LOG_WORK_ARGS */
+	const char *type;
+	int index;
+} log_work_args_t;
 
 static struct {
 	conmgr_work_status_t status;
@@ -121,8 +131,10 @@ static void _log_work(work_t *work, const char *caller, const char *fmt, ...)
 	if (!(slurm_conf.debug_flags & DEBUG_FLAG_CONMGR))
 		return;
 
-	if (work->con)
-		xstrfmtcat(con_name, " [%s]", work->con->name);
+	if (work->ref) {
+		conmgr_fd_t *con = fd_get_ref(work->ref);
+		xstrfmtcat(con_name, " [%s]", con->name);
+	}
 
 	if (work->callback.func)
 		xstrfmtcat(callback, "callback=%s(arg=0x%"PRIxPTR") ",
@@ -170,32 +182,119 @@ static void _log_work(work_t *work, const char *caller, const char *fmt, ...)
 	xfree(fmtstr);
 }
 
-extern void wrap_work(work_t *work)
+static work_t *_find_con_work(conmgr_fd_t *con, work_t *work)
 {
-	conmgr_fd_t *con = work->con;
+	work_t *test = NULL, *next = NULL;
+
+	/* Only try running if in RUN status */
+	if (work->status != CONMGR_WORK_STATUS_RUN)
+		return NULL;
+
+	if (!con->work || list_is_empty(con->work))
+		return NULL;
+
+	if (!(test = list_peek(con->work)))
+		return NULL;
+
+	xassert(test->magic == MAGIC_WORK);
+	xassert(test->control.depend_type != CONMGR_WORK_DEP_INVALID);
+	xassert(test->ref->con == con);
+	xassert(test->status == CONMGR_WORK_STATUS_PENDING);
+
+	if (test->control.schedule_type != CONMGR_WORK_SCHED_FIFO)
+		return NULL;
+
+	/* Work must not have any dependencies that could require ordering */
+	if (test->control.depend_type != CONMGR_WORK_DEP_NONE)
+		return NULL;
+
+	next = list_pop(con->work);
+	xassert(next == test);
+
+	return next;
+}
+
+static work_t *_con_all_work_complete(conmgr_fd_t *con, work_t *work)
+{
+	work_t *next = NULL;
+	/*
+	 * All connection work has completed and we will call
+	 * handle_connection() to check the connection. In most cases,
+	 * handle_connection() will add more connection work which can be
+	 * executed next.
+	 */
+	con_unset_flag(con, FLAG_WORK_ACTIVE);
+
+	handle_connection(true, con);
+
+	if (!con_flag(con, FLAG_WORK_ACTIVE) &&
+	    (next = _find_con_work(con, work))) {
+		con_set_flag(con, FLAG_WORK_ACTIVE);
+		return next;
+	}
+
+	/*
+	 * No new eligible work was queued that can be run now, wake up watch to
+	 * see if other work can be done instead
+	 */
+	EVENT_SIGNAL(&mgr.watch_sleep);
+	return NULL;
+}
+
+static work_t *_on_con_work_complete(conmgr_fd_t *con, work_t *work)
+{
+	work_t *next = NULL;
+
+	slurm_mutex_lock(&mgr.mutex);
+	/* con may be xfree()ed any time once lock is released */
+
+	if ((next = _find_con_work(con, work)) ||
+	    (next = _con_all_work_complete(con, work)))
+		work->status = CONMGR_WORK_STATUS_RUN;
+
+	fd_free_ref(&work->ref);
+
+	slurm_mutex_unlock(&mgr.mutex);
+
+	return next;
+}
+
+static work_t *_run_work(work_t *work)
+{
+	conmgr_fd_t *con = NULL;
+	work_t *next = NULL;
 
 	xassert(work->magic == MAGIC_WORK);
 
+	if (work->ref) {
+		con = fd_get_ref(work->ref);
+		xassert(con->magic == MAGIC_CON_MGR_FD);
+	}
+
 	_log_work(work, __func__, "BEGIN");
 
-	work->callback.func((conmgr_callback_args_t) {
-				.con = work->con,
-				.status = work->status,
-			    }, work->callback.arg);
+	work->callback.func(
+		(conmgr_callback_args_t) {
+			.con = con,
+			.status = work->status,
+		},
+		work->callback.arg);
 
 	_log_work(work, __func__, "END");
 
-	if (con) {
-		slurm_mutex_lock(&mgr.mutex);
-		con_unset_flag(con, FLAG_WORK_ACTIVE);
-		/* con may be xfree()ed any time once lock is released */
-
-		EVENT_SIGNAL(&mgr.watch_sleep);
-		slurm_mutex_unlock(&mgr.mutex);
-	}
+	if (con)
+		next = _on_con_work_complete(con, work);
 
 	work->magic = ~MAGIC_WORK;
 	xfree(work);
+
+	return next;
+}
+
+extern void wrap_work(work_t *work)
+{
+	while ((work = _run_work(work)))
+		/* do nothing */;
 }
 
 /*
@@ -229,7 +328,7 @@ static void _handle_work_run(work_t *work)
  */
 static void _handle_work_pending(work_t *work)
 {
-	conmgr_fd_t *con = work->con;
+	conmgr_fd_t *con = fd_get_ref(work->ref);
 	conmgr_work_depend_t depend = work->control.depend_type;
 
 	xassert(work->magic == MAGIC_WORK);
@@ -338,18 +437,100 @@ extern void add_work(bool locked, conmgr_fd_t *con, conmgr_callback_t callback,
 	*work = (work_t) {
 		.magic = MAGIC_WORK,
 		.status = CONMGR_WORK_STATUS_PENDING,
-		.con = con,
 		.callback = callback,
 		.control = control,
 	};
 
+	if (!locked)
+		slurm_mutex_lock(&mgr.mutex);
+
+	if (con)
+		work->ref = fd_new_ref(con);
+
 	work_mask_depend(work, depend_mask);
 
-	handle_work(locked, work);
+	handle_work(true, work);
+
+	if (!locked)
+		slurm_mutex_unlock(&mgr.mutex);
 }
 
 extern void conmgr_add_work(conmgr_fd_t *con, conmgr_callback_t callback,
 			    conmgr_work_control_t control, const char *caller)
 {
 	add_work(false, con, callback, control, 0, caller);
+}
+
+extern size_t printf_work(const work_t *work, char *buffer, size_t len,
+			  bool include_connection)
+{
+	size_t wrote = 0;
+	char time_begin[CTIME_STR_LEN] = "n/a";
+	char *schedule_type = NULL, *depend_type = NULL;
+
+	if (work->control.schedule_type != CONMGR_WORK_SCHED_INVALID)
+		schedule_type =
+			conmgr_work_sched_string(work->control.schedule_type);
+	if (work->control.depend_type != CONMGR_WORK_DEP_INVALID)
+		depend_type =
+			conmgr_work_depend_string(work->control.depend_type);
+
+	xassert(work->magic == MAGIC_WORK);
+
+	if (work->control.depend_type & CONMGR_WORK_DEP_TIME_DELAY)
+		timespec_ctime(work->control.time_begin, true, time_begin,
+			       sizeof(time_begin));
+
+	wrote = snprintf(
+		buffer, len,
+		"%s%s%sstatus:%s callback:%s(0x%" PRIxPTR
+		") schedule_type=%s depend_type=%s time_begin:%s on_signal_number:%d",
+		((include_connection && work->ref) ? "[" : ""),
+		((include_connection && work->ref) ? work->ref->con->name : ""),
+		((include_connection && work->ref) ? "] " : ""),
+		conmgr_work_status_string(work->status),
+		work->callback.func_name, (uintptr_t) work->callback.arg,
+		schedule_type, depend_type, time_begin,
+		work->control.on_signal_number);
+
+	xfree(schedule_type);
+	xfree(depend_type);
+
+	return wrote;
+}
+
+static int _foreach_log_work(void *x, void *arg)
+{
+	const work_t *work = x;
+	log_work_args_t *args = arg;
+	char str[PRINTF_WORK_CHARS];
+
+	xassert(args->magic == MAGIC_LOG_WORK_ARGS);
+	xassert(work->magic == MAGIC_WORK);
+
+	printf_work(work, str, sizeof(str), true);
+
+	info("%s[%d]: %s", args->type, args->index, str);
+
+	args->index++;
+
+	return SLURM_SUCCESS;
+}
+
+extern void conmgr_log_work(void)
+{
+	log_work_args_t args = {
+		.magic = MAGIC_LOG_WORK_ARGS,
+		.type = "delayed_work",
+	};
+
+	info("work queues: work:%d delayed_work:%d",
+	     list_count(mgr.work), list_count(mgr.delayed_work));
+
+	(void) list_for_each_ro(mgr.delayed_work, _foreach_log_work, &args);
+
+	args.index = 0;
+	args.type = "work";
+
+	(void) list_for_each_ro(mgr.work, _foreach_log_work, &args);
 }

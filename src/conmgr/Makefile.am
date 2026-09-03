@@ -13,8 +13,6 @@ libconmgr_la_SOURCES = \
 	conmgr.h \
 	delayed.c \
 	delayed.h \
-	events.c \
-	events.h \
 	io.c \
 	mgr.h \
 	poll.c \
@@ -23,6 +21,10 @@ libconmgr_la_SOURCES = \
 	rpc.c \
 	signals.c \
 	signals.h \
+	tls.c \
+	tls.h \
+	tls_fingerprint.c \
+	tls_fingerprint.h \
 	watch.c \
 	work.c \
 	workers.c

@@ -33,19 +33,14 @@
  *  51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA.
 \*****************************************************************************/
 
-#define _GNU_SOURCE
 #include <limits.h>
 #include <stdbool.h>
-#include <sys/stat.h>
+#include <stdint.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/un.h>
 #include <unistd.h>
-
-#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__)
-#include <sys/param.h>
-#include <sys/ucred.h>
-#endif
 
 #if defined(__linux__)
 #include <sys/sysmacros.h>
@@ -55,11 +50,14 @@
 #include "slurm/slurm_errno.h"
 
 #include "src/common/fd.h"
+#include "src/common/http.h"
 #include "src/common/log.h"
 #include "src/common/macros.h"
 #include "src/common/net.h"
 #include "src/common/pack.h"
 #include "src/common/read_config.h"
+#include "src/common/slurm_protocol_api.h"
+#include "src/common/slurm_protocol_defs.h"
 #include "src/common/slurm_protocol_socket.h"
 #include "src/common/slurm_time.h"
 #include "src/common/util-net.h"
@@ -70,6 +68,13 @@
 #include "src/conmgr/delayed.h"
 #include "src/conmgr/mgr.h"
 #include "src/conmgr/polling.h"
+#include "src/conmgr/tls.h"
+
+#include "src/interfaces/conn.h"
+#include "src/interfaces/tls.h"
+#include "src/interfaces/url_parser.h"
+
+#define CTIME_STR_LEN 72
 
 #define T(type) { type, XSTRINGIFY(type) }
 static const struct {
@@ -106,6 +111,13 @@ static const struct {
 	T(FLAG_WATCH_WRITE_TIMEOUT),
 	T(FLAG_WATCH_READ_TIMEOUT),
 	T(FLAG_WATCH_CONNECT_TIMEOUT),
+	T(FLAG_TLS_SERVER),
+	T(FLAG_TLS_CLIENT),
+	T(FLAG_IS_TLS_CONNECTED),
+	T(FLAG_TLS_FINGERPRINT),
+	T(FLAG_TLS_WAIT_ON_CLOSE),
+	T(FLAG_RPC_RECV_FORWARD),
+	T(FLAG_WAIT_ON_EXTRACT),
 };
 #undef T
 
@@ -114,6 +126,7 @@ typedef struct {
 	void *arg;
 	conmgr_con_type_t type;
 	int rc;
+	conmgr_con_flags_t flags;
 } socket_listen_init_t;
 
 typedef struct {
@@ -129,6 +142,14 @@ typedef struct {
 	int magic; /* MAGIC_SEND_FD */
 	int fd; /* fd to send over con */
 } send_fd_args_t;
+
+#define MAGIC_CON_LOG_WORK_ARGS 0xaafb100b
+
+typedef struct {
+	int magic; /* MAGIC_CON_LOG_WORK_ARGS */
+	const char *type;
+	int index;
+} log_con_work_args_t;
 
 static void _validate_pctl_type(pollctl_fd_type_t type)
 {
@@ -194,6 +215,9 @@ extern void close_all_connections(void)
 	/* close all connections */
 	list_for_each(mgr.connections, _close_con_for_each, NULL);
 	list_for_each(mgr.listen_conns, _close_con_for_each, NULL);
+
+	/* Wake up poll() as all the connections should be closed */
+	pollctl_interrupt(__func__);
 }
 
 extern void work_close_con(conmgr_callback_args_t conmgr_args, void *arg)
@@ -242,6 +266,8 @@ extern void close_con(bool locked, conmgr_fd_t *con)
 	/* drop any unprocessed input buffer */
 	if (con->in)
 		set_buf_offset(con->in, 0);
+	if (con->tls_in)
+		set_buf_offset(con->tls_in, 0);
 
 	is_same_fd = (con->input_fd == con->output_fd);
 	is_socket = con_flag(con, FLAG_IS_SOCKET);
@@ -416,6 +442,12 @@ extern int fd_change_mode(conmgr_fd_t *con, conmgr_con_type_t type)
 	if (con->type == CON_TYPE_RPC)
 		con_set_flag(con, FLAG_TCP_NODELAY);
 
+	/* New mode should run on_data() if there is anything pending */
+	con_unset_flag(con, FLAG_ON_DATA_TRIED);
+
+	/* Reset polling to trigger re-evaluation */
+	con_set_polling(con, PCTL_TYPE_NONE, __func__);
+
 	con->type = type;
 
 	if (con_flag(con, FLAG_IS_SOCKET) && con_flag(con, FLAG_TCP_NODELAY) &&
@@ -453,7 +485,8 @@ extern int add_connection(conmgr_con_type_t type,
 			  conmgr_con_flags_t flags,
 			  const slurm_addr_t *addr,
 			  socklen_t addrlen, bool is_listen,
-			  const char *unix_socket_path, void *arg)
+			  const char *unix_socket_path, void *tls_conn,
+			  void *arg)
 {
 	struct stat in_stat = { 0 };
 	struct stat out_stat = { 0 };
@@ -539,6 +572,15 @@ extern int add_connection(conmgr_con_type_t type,
 	con_assign_flag(con, FLAG_IS_FIFO, is_fifo);
 	con_assign_flag(con, FLAG_IS_CHR, is_chr);
 
+	/*
+	 * FLAG_TLS_FINGERPRINT is mutually exclusive with FLAG_TLS_CLIENT or
+	 * FLAG_TLS_SERVER. It is expected that FLAG_TLS_FINGERPRINT may be set
+	 * by default, which means we should silently remove
+	 * FLAG_TLS_FINGERPRINT if either are set.
+	 */
+	if (con_flag(con, FLAG_TLS_CLIENT) || con_flag(con, FLAG_TLS_SERVER))
+		con_unset_flag(con, FLAG_TLS_FINGERPRINT);
+
 	if (!is_listen) {
 		con->in = create_buf(xmalloc(BUFFER_START_SIZE),
 				     BUFFER_START_SIZE);
@@ -566,12 +608,26 @@ extern int add_connection(conmgr_con_type_t type,
 		memcpy(&con->address, addr, addrlen);
 	}
 
+	if (is_socket && (con->address.ss_family == AF_UNSPEC)) {
+		int rc = SLURM_SUCCESS;
+		int fd = (has_out ? output_fd : input_fd);
+
+		if (!is_listen &&
+		    (rc = slurm_get_peer_addr(fd, &con->address))) {
+			log_flag(CONMGR, "%s: [fd:%d] Unable to resolve remote host: %s",
+				 __func__, fd, slurm_strerror(rc));
+		} else if (slurm_get_stream_addr(fd, &con->address)) {
+			log_flag(CONMGR, "%s: [fd:%d] Unable to resolve bind()ed IP: %m",
+				 __func__, fd);
+		}
+	}
+
 	if (has_out) {
 		int bytes = -1;
 
 		if (!fd_get_buffered_output_bytes(con->output_fd, &bytes,
 						  con->name)) {
-			xassert(!bytes);
+			xassert(bytes >= 0);
 			con_set_flag(con, FLAG_CAN_QUERY_OUTPUT_BUFFER);
 		}
 	}
@@ -592,6 +648,9 @@ extern int add_connection(conmgr_con_type_t type,
 		xfree(flags);
 	}
 
+	if (tls_conn)
+		tls_adopt(con, tls_conn);
+
 	slurm_mutex_lock(&mgr.mutex);
 	if (is_listen) {
 		xassert(con->output_fd <= 0);
@@ -600,9 +659,16 @@ extern int add_connection(conmgr_con_type_t type,
 		list_append(mgr.connections, con);
 	}
 
-	/* interrupt poll () and wake up watch() to examine new connection */
+	/* Attempt to handle connection state immediately */
+	handle_connection(true, con);
+
+	/*
+	 * interrupt poll () and wake up watch() to eventually re-examine new
+	 * connection.
+	 */
 	pollctl_interrupt(__func__);
 	EVENT_SIGNAL(&mgr.watch_sleep);
+
 	slurm_mutex_unlock(&mgr.mutex);
 
 	return SLURM_SUCCESS;
@@ -654,10 +720,10 @@ extern int conmgr_process_fd(conmgr_con_type_t type, int input_fd,
 			     int output_fd, const conmgr_events_t *events,
 			     conmgr_con_flags_t flags,
 			     const slurm_addr_t *addr, socklen_t addrlen,
-			     void *arg)
+			     void *tls_conn, void *arg)
 {
 	return add_connection(type, NULL, input_fd, output_fd, events,
-			      flags, addr, addrlen, false, NULL, arg);
+			      flags, addr, addrlen, false, NULL, tls_conn, arg);
 }
 
 extern int conmgr_process_fd_listen(int fd, conmgr_con_type_t type,
@@ -665,7 +731,7 @@ extern int conmgr_process_fd_listen(int fd, conmgr_con_type_t type,
 				    conmgr_con_flags_t flags, void *arg)
 {
 	return add_connection(type, NULL, fd, -1, events, flags, NULL,
-			      0, true, NULL, arg);
+			      0, true, NULL, NULL, arg);
 }
 
 static void _receive_fd(conmgr_callback_args_t conmgr_args, void *arg)
@@ -696,7 +762,7 @@ static void _receive_fd(conmgr_callback_args_t conmgr_args, void *arg)
 		close_con(false, src);
 	} else if (add_connection(args->type, NULL, fd, fd, args->events,
 				  CON_FLAG_NONE, NULL, 0, false, NULL,
-				  args->arg) != SLURM_SUCCESS) {
+				  NULL, args->arg) != SLURM_SUCCESS) {
 		/*
 		 * Error already logged by add_connection() and there is no
 		 * reason to assume that failing is due to the state of src.
@@ -826,22 +892,62 @@ static void _deferred_close_fd(conmgr_callback_args_t conmgr_args, void *arg)
 	}
 }
 
-extern void conmgr_queue_close_fd(conmgr_fd_t *con)
+/* Caller must hold mgr.mutex lock */
+static void _close_fd(conmgr_fd_t *con)
 {
 	xassert(con->magic == MAGIC_CON_MGR_FD);
 
-	slurm_mutex_lock(&mgr.mutex);
 	if (!con_flag(con, FLAG_WORK_ACTIVE)) {
 		/*
 		 * Defer request to close connection until connection is no
 		 * longer actively doing work as closing connection would change
-		 * several variables guarenteed to not change while work is
+		 * several variables guaranteed to not change while work is
 		 * active.
 		 */
 		add_work_con_fifo(true, con, _deferred_close_fd, con);
 	} else {
 		close_con(true, con);
 	}
+}
+
+extern void conmgr_queue_close_fd(conmgr_fd_t *con)
+{
+	xassert(con->magic == MAGIC_CON_MGR_FD);
+
+	slurm_mutex_lock(&mgr.mutex);
+	_close_fd(con);
+	slurm_mutex_unlock(&mgr.mutex);
+}
+
+extern void conmgr_con_queue_close(conmgr_fd_ref_t *ref)
+{
+	if (!ref || !ref->con)
+		return;
+
+	xassert(ref->magic == MAGIC_CON_MGR_FD_REF);
+	xassert(ref->con->magic == MAGIC_CON_MGR_FD);
+
+	slurm_mutex_lock(&mgr.mutex);
+	_close_fd(ref->con);
+	slurm_mutex_unlock(&mgr.mutex);
+}
+
+extern void conmgr_con_queue_close_free(conmgr_fd_ref_t **ref_ptr)
+{
+	conmgr_fd_ref_t *ref = NULL;
+
+	xassert(ref_ptr);
+
+	/* skip if already released */
+	if (!(ref = *ref_ptr))
+		return;
+
+	xassert(ref->magic == MAGIC_CON_MGR_FD_REF);
+	xassert(ref->con->magic == MAGIC_CON_MGR_FD);
+
+	slurm_mutex_lock(&mgr.mutex);
+	_close_fd(ref->con);
+	fd_free_ref(ref_ptr);
 	slurm_mutex_unlock(&mgr.mutex);
 }
 
@@ -919,72 +1025,58 @@ static bool _is_listening(const slurm_addr_t *addr, socklen_t addrlen)
 	return false;
 }
 
-extern int conmgr_create_listen_socket(conmgr_con_type_t type,
-					const char *listen_on,
-					const conmgr_events_t *events,
-					void *arg)
+static int _add_unix_listener(conmgr_con_type_t type, conmgr_con_flags_t flags,
+			      const char *listen_on, const char *unixsock,
+			      const conmgr_events_t *events, void *arg)
 {
-	static const char UNIX_PREFIX[] = "unix:";
-	const char *unixsock = xstrstr(listen_on, UNIX_PREFIX);
+	slurm_addr_t addr = { 0 };
+	int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+	int rc = EINVAL;
+
+	if (fd < 0)
+		fatal("%s: socket() failed: %m", __func__);
+
+	addr = sockaddr_from_unix_path(unixsock);
+
+	if (addr.ss_family != AF_UNIX)
+		fatal("%s: [%s] Invalid Unix socket path: %s",
+		      __func__, listen_on, unixsock);
+
+	log_flag(CONMGR, "%s: [%pA] attempting to bind() and listen() UNIX socket",
+		 __func__, &addr);
+
+	if (unlink(unixsock) && (errno != ENOENT))
+		error("Error unlink(%s): %m", unixsock);
+
+	/* bind() will EINVAL if socklen=sizeof(addr) */
+	if ((rc = bind(fd, (const struct sockaddr *) &addr,
+		       sizeof(struct sockaddr_un))))
+		fatal("%s: [%s] Unable to bind UNIX socket: %m",
+		      __func__, listen_on);
+
+	fd_set_oob(fd, 0);
+
+	rc = listen(fd, SLURM_DEFAULT_LISTEN_BACKLOG);
+	if (rc < 0)
+		fatal("%s: [%s] unable to listen(): %m",
+		      __func__, listen_on);
+
+	return add_connection(type, NULL, fd, -1, events, flags, &addr,
+			      sizeof(addr), true, unixsock, NULL, arg);
+}
+
+static int _add_socket_listener(conmgr_con_type_t type,
+				conmgr_con_flags_t flags, const char *listen_on,
+				url_t *url, const conmgr_events_t *events,
+				void *arg)
+{
 	int rc = SLURM_SUCCESS;
 	struct addrinfo *addrlist = NULL;
-	parsed_host_port_t *parsed_hp;
-	conmgr_callbacks_t callbacks;
 
-	slurm_mutex_lock(&mgr.mutex);
-	callbacks = mgr.callbacks;
-	slurm_mutex_unlock(&mgr.mutex);
-
-	/* check for name local sockets */
-	if (unixsock) {
-		slurm_addr_t addr = {0};
-		int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-
-		if (fd < 0)
-			fatal("%s: socket() failed: %m", __func__);
-
-		unixsock += sizeof(UNIX_PREFIX) - 1;
-		if (unixsock[0] == '\0')
-			fatal("%s: [%s] Invalid UNIX socket",
-			      __func__, listen_on);
-
-		addr = sockaddr_from_unix_path(unixsock);
-
-		if (addr.ss_family != AF_UNIX)
-			fatal("%s: [%s] Invalid Unix socket path: %s",
-			      __func__, listen_on, unixsock);
-
-		log_flag(CONMGR, "%s: [%pA] attempting to bind() and listen() UNIX socket",
-			 __func__, &addr);
-
-		if (unlink(unixsock) && (errno != ENOENT))
-			error("Error unlink(%s): %m", unixsock);
-
-		/* bind() will EINVAL if socklen=sizeof(addr) */
-		if ((rc = bind(fd, (const struct sockaddr *) &addr,
-			       sizeof(struct sockaddr_un))))
-			fatal("%s: [%s] Unable to bind UNIX socket: %m",
-			      __func__, listen_on);
-
-		fd_set_oob(fd, 0);
-
-		rc = listen(fd, SLURM_DEFAULT_LISTEN_BACKLOG);
-		if (rc < 0)
-			fatal("%s: [%s] unable to listen(): %m",
-			      __func__, listen_on);
-
-		return add_connection(type, NULL, fd, -1, events, CON_FLAG_NONE,
-				      &addr, sizeof(addr), true, unixsock, arg);
-	} else {
-		/* split up host and port */
-		if (!(parsed_hp = callbacks.parse(listen_on)))
-			fatal("%s: Unable to parse %s", __func__, listen_on);
-
-		/* resolve out the host and port if provided */
-		if (!(addrlist = xgetaddrinfo(parsed_hp->host,
-					      parsed_hp->port)))
-			fatal("Unable to listen on %s", listen_on);
-	}
+	/* resolve out the host and port if provided */
+	if (!(addrlist = xgetaddrinfo(url->host, url->port)))
+		fatal("%s: Unable to listen on %s:%s(%s): %m",
+		      __func__, url->host, url->port, listen_on);
 
 	/*
 	 * Create a socket for every address returned
@@ -1031,14 +1123,54 @@ extern int conmgr_create_listen_socket(conmgr_con_type_t type,
 			fatal("%s: [%s] unable to listen(): %m",
 			      __func__, addrinfo_to_string(addr));
 
-		rc = add_connection(type, NULL, fd, -1, events, CON_FLAG_NONE,
+		rc = add_connection(type, NULL, fd, -1, events, flags,
 				    (const slurm_addr_t *) addr->ai_addr,
-				    addr->ai_addrlen, true, NULL, arg);
+				    addr->ai_addrlen, true, NULL, NULL, arg);
 	}
 
 	freeaddrinfo(addrlist);
-	callbacks.free_parse(parsed_hp);
+	return rc;
+}
 
+extern int conmgr_create_listen_socket(conmgr_con_type_t type,
+				       conmgr_con_flags_t flags,
+				       const char *listen_on,
+				       const conmgr_events_t *events, void *arg)
+{
+	int rc = SLURM_SUCCESS;
+	url_t url = URL_INITIALIZER;
+	buf_t buffer = {
+		.magic = BUF_MAGIC,
+		.head = (void *) listen_on,
+		.processed = strlen(listen_on),
+		.size = strlen(listen_on),
+		.shadow = true,
+	};
+
+	if ((rc = url_parser_g_parse(__func__, &buffer, &url)))
+		fatal("%s: Unable to parse %s: %s",
+		      __func__, listen_on, slurm_strerror(rc));
+
+	switch (url.scheme) {
+	case URL_SCHEME_UNIX:
+		rc = _add_unix_listener(type, flags, listen_on, url.path,
+					events, arg);
+		break;
+	case URL_SCHEME_HTTPS:
+		flags |= CON_FLAG_TLS_SERVER;
+		if (!tls_available())
+			fatal("Cannot create https:// socket because no TLS plugin is available");
+		/* fall through */
+	case URL_SCHEME_HTTP:
+	case URL_SCHEME_INVALID:
+		rc = _add_socket_listener(type, flags, listen_on, &url, events,
+					  arg);
+		break;
+	case URL_SCHEME_INVALID_MAX:
+		fatal_abort("should never happen");
+	}
+
+	url_free_members(&url);
 	return rc;
 }
 
@@ -1047,13 +1179,15 @@ static int _setup_listen_socket(void *x, void *arg)
 	const char *hostport = (const char *)x;
 	socket_listen_init_t *init = arg;
 
-	init->rc = conmgr_create_listen_socket(init->type, hostport,
-					       init->events, init->arg);
+	init->rc = conmgr_create_listen_socket(init->type, init->flags,
+					       hostport, init->events,
+					       init->arg);
 
 	return (init->rc ? SLURM_ERROR : SLURM_SUCCESS);
 }
 
 extern int conmgr_create_listen_sockets(conmgr_con_type_t type,
+					conmgr_con_flags_t flags,
 					list_t *hostports,
 					const conmgr_events_t *events,
 					void *arg)
@@ -1062,6 +1196,7 @@ extern int conmgr_create_listen_sockets(conmgr_con_type_t type,
 		.events = events,
 		.arg = arg,
 		.type = type,
+		.flags = flags,
 	};
 
 	(void) list_for_each(hostports, _setup_listen_socket, &init);
@@ -1069,6 +1204,7 @@ extern int conmgr_create_listen_sockets(conmgr_con_type_t type,
 }
 
 extern int conmgr_create_connect_socket(conmgr_con_type_t type,
+					conmgr_con_flags_t flags,
 					slurm_addr_t *addr, socklen_t addrlen,
 					const conmgr_events_t *events,
 					void *arg)
@@ -1136,53 +1272,79 @@ again:
 		/* delayed connect() completion is expected */
 	}
 
-	return add_connection(type, NULL, fd, fd, events, CON_FLAG_NONE, addr,
-			      addrlen, false, NULL, arg);
+	return add_connection(type, NULL, fd, fd, events, flags, addr, addrlen,
+			      false, NULL, NULL, arg);
 }
 
-extern int conmgr_get_fd_auth_creds(conmgr_fd_t *con,
-				     uid_t *cred_uid, gid_t *cred_gid,
-				     pid_t *cred_pid)
+/* WARNING: caller must not hold mgr.mutex lock */
+static int _get_auth_creds(conmgr_fd_t *con, uid_t *cred_uid, gid_t *cred_gid,
+			   pid_t *cred_pid)
 {
-	int fd, rc = ESLURM_NOT_SUPPORTED;
+	int rc = EINVAL, input_fd = -1, output_fd = -1;
 
 	xassert(cred_uid);
 	xassert(cred_gid);
 	xassert(cred_pid);
+	xassert(con->magic == MAGIC_CON_MGR_FD);
 
-	if (!con || !cred_uid || !cred_gid || !cred_pid)
+	if (!cred_uid || !cred_gid || !cred_pid)
+		return rc;
+
+	slurm_mutex_lock(&mgr.mutex);
+
+	if (con_flag(con, FLAG_IS_SOCKET)) {
+		if (!con_flag(con, FLAG_READ_EOF))
+			input_fd = con->input_fd;
+
+		output_fd = con->output_fd;
+	}
+
+	slurm_mutex_unlock(&mgr.mutex);
+
+	if ((input_fd < 0) || (output_fd < 0)) {
+		/* Both sockets must be open to authenticate */
+		return SLURM_COMMUNICATIONS_MISSING_SOCKET_ERROR;
+	} else if ((rc = net_get_peer(input_fd, cred_uid, cred_gid,
+				      cred_pid))) {
+		return rc;
+	}
+
+	if (!rc) {
+		slurm_mutex_lock(&mgr.mutex);
+
+		/* Catch connection state changing during kernel queries */
+		if ((input_fd != con->input_fd) ||
+		    (output_fd != con->output_fd) ||
+		    con_flag(con, FLAG_READ_EOF))
+			rc = SLURM_COMMUNICATIONS_MISSING_SOCKET_ERROR;
+
+		slurm_mutex_unlock(&mgr.mutex);
+	}
+
+	return rc;
+}
+
+extern int conmgr_get_fd_auth_creds(conmgr_fd_t *con, uid_t *cred_uid,
+				    gid_t *cred_gid, pid_t *cred_pid)
+{
+	if (!con)
 		return EINVAL;
 
 	xassert(con->magic == MAGIC_CON_MGR_FD);
 
-	if (((fd = con->input_fd) == -1) && ((fd = con->output_fd) == -1))
-		return SLURMCTLD_COMMUNICATIONS_CONNECTION_ERROR;
+	return _get_auth_creds(con, cred_uid, cred_gid, cred_pid);
+}
 
-#if !defined(__APPLE__) && !defined(__FreeBSD__) && !defined(__NetBSD__)
-	struct ucred cred = { 0 };
-	socklen_t len = sizeof(cred);
-	if (!getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &len)) {
-		*cred_uid = cred.uid;
-		*cred_gid = cred.gid;
-		*cred_pid = cred.pid;
-		return SLURM_SUCCESS;
-	} else {
-		rc = errno;
-	}
-#else
-	struct xucred cred = { 0 };
-	socklen_t len = sizeof(cred);
-	if (!getsockopt(fd, 0, LOCAL_PEERCRED, &cred, &len)) {
-		*cred_uid = cred.cr_uid;
-		*cred_gid = cred.cr_groups[0];
-		*cred_pid = cred.cr_pid;
-		return SLURM_SUCCESS;
-	} else {
-		rc = errno;
-	}
-#endif
+extern int conmgr_con_get_auth_creds(conmgr_fd_ref_t *con, uid_t *cred_uid,
+				     gid_t *cred_gid, pid_t *cred_pid)
+{
+	if (!con || !con->con)
+		return EINVAL;
 
-	return rc;
+	xassert(con->magic == MAGIC_CON_MGR_FD_REF);
+	xassert(con->con->magic == MAGIC_CON_MGR_FD);
+
+	return _get_auth_creds(con->con, cred_uid, cred_gid, cred_pid);
 }
 
 extern const char *conmgr_fd_get_name(const conmgr_fd_t *con)
@@ -1190,6 +1352,21 @@ extern const char *conmgr_fd_get_name(const conmgr_fd_t *con)
 	xassert(con->magic == MAGIC_CON_MGR_FD);
 	xassert(con->name && con->name[0]);
 	return con->name;
+}
+
+extern const char *conmgr_con_get_name(conmgr_fd_ref_t *ref)
+{
+	if (!ref)
+		return NULL;
+
+	xassert(ref->magic == MAGIC_CON_MGR_FD_REF);
+
+	if (!ref->con)
+		return NULL;
+
+	xassert(ref->con->magic == MAGIC_CON_MGR_FD);
+
+	return conmgr_fd_get_name(ref->con);
 }
 
 extern conmgr_fd_status_t conmgr_fd_get_status(conmgr_fd_t *con)
@@ -1254,39 +1431,45 @@ extern void con_close_on_poll_error(conmgr_fd_t *con, int fd)
 	/*
 	 * Socket must not continue to be considered valid to avoid a
 	 * infinite calls to poll() which will immediately fail. Close
-	 * the relavent file descriptor and remove from connection.
+	 * the relevant file descriptor and remove from connection.
 	 */
 	close_con(true, con);
 }
 
-static int _set_fd_polling(int fd, pollctl_fd_type_t old, pollctl_fd_type_t new,
-			   const char *con_name, const char *caller)
+static int _set_fd_polling(int fd, pollctl_fd_type_t *old,
+			   pollctl_fd_type_t new, const char *con_name,
+			   const char *caller)
 {
-	if (old == PCTL_TYPE_UNSUPPORTED)
-		return PCTL_TYPE_UNSUPPORTED;
+	if (*old == PCTL_TYPE_UNSUPPORTED)
+		return SLURM_SUCCESS;
 
-	if (old == new)
-		return new;
+	if (*old == new)
+		return SLURM_SUCCESS;
 
 	if (new == PCTL_TYPE_NONE) {
-		if (old != PCTL_TYPE_NONE)
-			pollctl_unlink_fd(fd, con_name, caller);
-		return new;
+		int rc = SLURM_SUCCESS;
+
+		if ((*old != PCTL_TYPE_NONE) &&
+		    !(rc = pollctl_unlink_fd(fd, con_name, caller)))
+			*old = new;
+
+		return rc;
 	}
 
-	if (old != PCTL_TYPE_NONE) {
-		pollctl_relink_fd(fd, new, con_name, caller);
-		return new;
+	if (*old != PCTL_TYPE_NONE) {
+		int rc;
+
+		if (!(rc = pollctl_relink_fd(fd, new, con_name, caller)))
+			*old = new;
+
+		return rc;
 	} else {
 		int rc = pollctl_link_fd(fd, new, con_name, caller);
 
 		if (!rc)
-			return new;
-		else if (rc == EPERM)
-			return PCTL_TYPE_UNSUPPORTED;
-		else
-			fatal("%s->%s: [%s] Unable to start polling: %s",
-			      caller, __func__, con_name, slurm_strerror(rc));
+			*old = new;
+
+		return rc;
 	}
 }
 
@@ -1335,10 +1518,100 @@ static void _log_set_polling(conmgr_fd_t *con, bool has_in, bool has_out,
 	xfree(log);
 }
 
+static void _on_change_polling_fail(conmgr_fd_t *con, int rc,
+				    pollctl_fd_type_t old_type,
+				    pollctl_fd_type_t new_type,
+				    const char *fd_name, const int fd,
+				    pollctl_fd_type_t *dst, const char *caller)
+{
+	error("%s->%s: [%s] closing connection after change polling %s->%s for %s=%d failed: %s",
+	      caller, __func__, con->name, pollctl_type_to_string(old_type),
+	      pollctl_type_to_string(new_type), fd_name, fd,
+	      slurm_strerror(rc));
+
+	if (rc == EBADF) {
+		/* Remove defunct FD immediately */
+		if (con->input_fd == fd) {
+			con->input_fd = -1;
+			con->polling_input_fd = PCTL_TYPE_UNSUPPORTED;
+			con_unset_flag(con, FLAG_CAN_READ);
+			con_set_flag(con, FLAG_READ_EOF);
+		}
+
+		if (con->output_fd == fd) {
+			con->output_fd = -1;
+			con->polling_output_fd = PCTL_TYPE_UNSUPPORTED;
+			con_unset_flag(con, FLAG_CAN_WRITE);
+			con_unset_flag(con, FLAG_CAN_QUERY_OUTPUT_BUFFER);
+		}
+	} else {
+		/* Attempt graceful closing of connection */
+		*dst = PCTL_TYPE_UNSUPPORTED;
+	}
+
+	close_con(true, con);
+	close_con_output(true, con);
+}
+
+static void _on_change_polling_rc(conmgr_fd_t *con, int rc,
+				  pollctl_fd_type_t old_type,
+				  pollctl_fd_type_t new_type, bool input,
+				  const char *caller)
+{
+	const char *fd_name = (input ? "input_fd" : "output_fd");
+	const int fd = (input ? con->input_fd : con->output_fd);
+	pollctl_fd_type_t *dst =
+		(input ? &con->polling_input_fd : &con->polling_output_fd);
+
+	switch (rc) {
+	case EEXIST:
+		/*
+		 * poll() is already monitoring this file descriptor but conmgr
+		 * didn't ask for this poll()ing. conmgr has no idea what mode
+		 * poll() is already monitoring, so instead change to relink to
+		 * to set the correct mode.
+		 */
+
+		log_flag(CONMGR, "%s->%s: [%s] forcing changed polling %s->%s for %s=%d",
+			 caller, __func__, con->name,
+			 pollctl_type_to_string(old_type),
+			 pollctl_type_to_string(new_type), fd_name, fd);
+
+		if ((rc = pollctl_relink_fd(fd, new_type, con->name, __func__)))
+			_on_change_polling_fail(con, rc, old_type, new_type,
+						fd_name, fd, dst, caller);
+		else
+			*dst = new_type;
+
+		break;
+	case ENOENT:
+		log_flag(CONMGR, "%s->%s: [%s] ignoring request to change polling %s->%s for %s=%d",
+			 caller, __func__, con->name,
+			 pollctl_type_to_string(old_type),
+			 pollctl_type_to_string(new_type), fd_name, fd);
+
+		*dst = PCTL_TYPE_NONE;
+		break;
+	case EPERM:
+		log_flag(CONMGR, "%s->%s: [%s] polling %s->%s for %s=%d not supported by kernel",
+			 caller, __func__, con->name,
+			 pollctl_type_to_string(old_type),
+			 pollctl_type_to_string(new_type), fd_name, fd);
+
+		*dst = PCTL_TYPE_UNSUPPORTED;
+		break;
+	default:
+		_on_change_polling_fail(con, rc, old_type, new_type, fd_name,
+					fd, dst, caller);
+		break;
+	}
+}
+
 extern void con_set_polling(conmgr_fd_t *con, pollctl_fd_type_t type,
 			    const char *caller)
 {
 	int has_in, has_out, in, out, is_same;
+	int rc_in = SLURM_SUCCESS, rc_out = SLURM_SUCCESS;
 	pollctl_fd_type_t in_type = PCTL_TYPE_NONE, out_type = PCTL_TYPE_NONE;
 
 	_validate_pctl_type(type);
@@ -1351,7 +1624,20 @@ extern void con_set_polling(conmgr_fd_t *con, pollctl_fd_type_t type,
 	has_out = (out >= 0);
 	is_same = (con->input_fd == con->output_fd);
 
-	xassert(has_in || has_out);
+	if (!has_in && !has_out) {
+		xassert(con->polling_input_fd == PCTL_TYPE_NONE);
+		xassert(con->polling_output_fd == PCTL_TYPE_NONE);
+		xassert(type == PCTL_TYPE_NONE);
+
+		if (slurm_conf.debug_flags & DEBUG_FLAG_CONMGR) {
+			char *flags = con_flags_string(con->flags);
+			log_flag(CONMGR, "%s: skipping connection flags=%s",
+				 __func__, flags);
+			xfree(flags);
+		}
+
+		return;
+	}
 
 	/*
 	 * Map type to type per in/out. The in/out types are initialized to
@@ -1406,97 +1692,49 @@ extern void con_set_polling(conmgr_fd_t *con, pollctl_fd_type_t type,
 
 	if (is_same) {
 		/* same never link output_fd */
-		xassert(con->polling_output_fd == PCTL_TYPE_NONE);
+		xassert((con->polling_output_fd == PCTL_TYPE_NONE) ||
+			(con->polling_output_fd == PCTL_TYPE_UNSUPPORTED));
 
-		con->polling_input_fd =
-			_set_fd_polling(in, con->polling_input_fd, in_type,
+		rc_in = _set_fd_polling(in, &con->polling_input_fd, in_type,
 					con->name, caller);
 	} else {
 		if (has_in)
-			con->polling_input_fd =
-				_set_fd_polling(in, con->polling_input_fd,
+			rc_in = _set_fd_polling(in, &con->polling_input_fd,
 						in_type, con->name, caller);
 		if (has_out)
-			con->polling_output_fd =
-				_set_fd_polling(out, con->polling_output_fd,
-						out_type, con->name, caller);
+			rc_out = _set_fd_polling(out, &con->polling_output_fd,
+						 out_type, con->name, caller);
 	}
+
+	if (rc_in)
+		_on_change_polling_rc(con, rc_in, con->polling_input_fd,
+				      in_type, true, caller);
+
+	if (rc_out)
+		_on_change_polling_rc(con, rc_out, con->polling_output_fd,
+				      out_type, false, caller);
 }
 
-extern int conmgr_queue_extract_con_fd(conmgr_fd_t *con,
-				       conmgr_extract_fd_func_t func,
-				       const char *func_name,
-				       void *func_arg)
+extern void on_extract(conmgr_callback_args_t conmgr_args, void *arg)
 {
-	int rc = SLURM_ERROR;
+	int input_fd = -1, output_fd = -1;
+	void *conn = NULL;
+	conmgr_extract_fd_func_t func = NULL;
+	const char *func_name = NULL;
+	void *func_arg = NULL;
+	conmgr_fd_t *con = conmgr_args.con;
 
-	xassert(con);
-	xassert(func);
-	if (!con || !func)
-		return EINVAL;
+	xassert(!arg);
 
 	slurm_mutex_lock(&mgr.mutex);
+
 	xassert(con->magic == MAGIC_CON_MGR_FD);
 
-	if (con->extract) {
-		rc = EEXIST;
-	} else {
-		extract_fd_t *extract = xmalloc_nz(sizeof(*extract));
-		*extract = (extract_fd_t) {
-			.magic = MAGIC_EXTRACT_FD,
-			.func = func,
-			.func_name = func_name,
-			.func_arg = func_arg,
-			.input_fd = -1,
-			.output_fd = -1,
-		};
-
-		xassert(!con->extract);
-		con->extract = extract;
-
-		/* Disable all polling for this connection */
-		con_set_polling(con, PCTL_TYPE_NONE, __func__);
-
-		/* wake up watch to finish extraction */
-		EVENT_SIGNAL(&mgr.watch_sleep);
-
-		rc = SLURM_SUCCESS;
-	}
-
-	slurm_mutex_unlock(&mgr.mutex);
-
-	return rc;
-}
-
-static void _wrap_on_extract(conmgr_callback_args_t conmgr_args, void *arg)
-{
-	extract_fd_t *extract = arg;
-	xassert(extract->magic == MAGIC_EXTRACT_FD);
-
-	log_flag(CONMGR, "%s: calling %s() input_fd=%d output_fd=%d arg=0x%"PRIxPTR,
-		 __func__, extract->func_name, extract->input_fd,
-		 extract->output_fd, (uintptr_t) extract->func_arg);
-
-	extract->func(conmgr_args, extract->input_fd, extract->output_fd,
-		      extract->func_arg);
-
-	extract->magic = ~MAGIC_EXTRACT_FD;
-	xfree(extract);
-
-	/* wake up watch() to cleanup connection */
-	slurm_mutex_lock(&mgr.mutex);
-	EVENT_SIGNAL(&mgr.watch_sleep);
-	slurm_mutex_unlock(&mgr.mutex);
-}
-
-/* caller must hold mgr.mutex lock */
-extern void extract_con_fd(conmgr_fd_t *con)
-{
-	extract_fd_t *extract = NULL;
-
-	SWAP(extract, con->extract);
-	xassert(extract);
-	xassert(extract->magic == MAGIC_EXTRACT_FD);
+	/* Verify extract was requested */
+	xassert(con_flag(con, FLAG_WAIT_ON_EXTRACT));
+	xassert(con_flag(con, FLAG_WORK_ACTIVE));
+	xassert(con->on_extract.func);
+	xassert(con->on_extract.func_name);
 
 	/* Polling should already be disabled */
 	xassert((con->polling_input_fd == PCTL_TYPE_NONE) ||
@@ -1505,15 +1743,46 @@ extern void extract_con_fd(conmgr_fd_t *con)
 		(con->polling_output_fd == PCTL_TYPE_UNSUPPORTED));
 
 	/* can't extract safely when work running or not connected */
-	xassert(!con_flag(con, FLAG_WORK_ACTIVE));
 	xassert(con_flag(con, FLAG_IS_CONNECTED));
+	xassert(!(con_flag(con, FLAG_TLS_SERVER) ||
+		  con_flag(con, FLAG_TLS_CLIENT)) ||
+		  con_flag(con, FLAG_IS_TLS_CONNECTED));
+	xassert(!con_flag(con, FLAG_TLS_FINGERPRINT));
+	xassert(!con_flag(con, FLAG_TLS_WAIT_ON_CLOSE));
+	xassert(!con_flag(con, FLAG_WAIT_ON_FINISH));
+
+	/* assert input/outputs are empty */
+	xassert(!con->tls_out || list_is_empty(con->out));
+	xassert(!con->tls_in || !get_buf_offset(con->tls_in));
+	xassert(list_is_empty(con->out));
+	xassert(!get_buf_offset(con->in));
 
 	if (slurm_conf.debug_flags & DEBUG_FLAG_CONMGR) {
 		char *flags = con_flags_string(con->flags);
-		log_flag(CONMGR, "%s: extracting input_fd=%d output_fd=%d func=%s() flags=%s",
-			 __func__, con->input_fd, con->output_fd,
-			 extract->func_name, flags);
+		log_flag(CONMGR, "%s: [%s] BEGIN: extracting input_fd=%d output_fd=%d tls=0x%"PRIxPTR " func=%s(0x%"PRIxPTR") flags=%s",
+			 __func__, con->name, con->input_fd, con->output_fd,
+			 (uintptr_t) con->tls, con->on_extract.func_name,
+			 (uintptr_t) con->on_extract.func_arg, flags);
 		xfree(flags);
+	}
+
+	/*
+	 * Swap out func() and args to allow calling func() on failure
+	 * even if the file descriptors have not been extracted
+	 */
+	SWAP(func, con->on_extract.func);
+	SWAP(func_name, con->on_extract.func_name);
+	SWAP(func_arg, con->on_extract.func_arg);
+
+	if (conmgr_args.status == CONMGR_WORK_STATUS_CANCELLED)
+		goto failed;
+
+	/* Catch file descriptors being closed for any reason before now */
+	if (((con->input_fd < 0) || con_flag(con, FLAG_READ_EOF)) &&
+	    (con->output_fd < 0)) {
+		log_flag(CONMGR, "%s: [%s] invalid input_fd and output_fd",
+			 __func__, con->name);
+		goto failed;
 	}
 
 	/* clear all polling states */
@@ -1522,22 +1791,135 @@ extern void extract_con_fd(conmgr_fd_t *con)
 	con_unset_flag(con, FLAG_CAN_WRITE);
 	con_unset_flag(con, FLAG_ON_DATA_TRIED);
 
-	/* clear any buffered input/outputs */
-	list_flush(con->out);
-	set_buf_offset(con->in, 0);
+	/* Remove extraction state from connection */
+	SWAP(input_fd, con->input_fd);
+	SWAP(output_fd, con->output_fd);
+	SWAP(conn, con->tls);
+
+	slurm_mutex_unlock(&mgr.mutex);
 
 	/*
-	 * take the file descriptors, replacing the file descriptors in
-	 * con with invalid values initialied in conmgr_queue_extract_con_fd().
+	 * Treat partially shutdown connections as a single file descriptor to
+	 * avoid triggering assert()s or failures in interfaces/tls
 	 */
-	SWAP(extract->input_fd, con->input_fd);
-	SWAP(extract->output_fd, con->output_fd);
+	if (input_fd < 0)
+		input_fd = output_fd;
+	else if (output_fd < 0)
+		output_fd = input_fd;
 
-	/*
-	 * Queue up work but not against the connection as we want watch() to
-	 * cleanup the connection.
-	 */
-	add_work_fifo(true, _wrap_on_extract, extract);
+	/* Set file descriptors as blocking by default */
+	fd_set_blocking(input_fd);
+	if (input_fd != output_fd)
+		fd_set_blocking(output_fd);
+
+	if (conn) {
+		int rc = EINVAL;
+
+		/*
+		 * Assign ownership of the file descriptor to the interface/TLS
+		 * connection.
+		 */
+		if ((rc = tls_g_set_conn_fds(conn, input_fd, output_fd))) {
+			log_flag(CONMGR, "%s: [%s] tls_g_set_fds() failed: %s",
+				 __func__, con->name, slurm_strerror(rc));
+			slurm_mutex_lock(&mgr.mutex);
+			goto failed;
+		}
+	} else {
+		conn_args_t args = {
+			.input_fd = input_fd,
+			.output_fd = output_fd,
+		};
+
+		/* Create new interface/conn connection from file descriptors */
+		if (!(conn = conn_g_create(&args))) {
+			log_flag(CONMGR, "%s: [%s] conn_g_create() failed: %m",
+				 __func__, con->name);
+			slurm_mutex_lock(&mgr.mutex);
+			goto failed;
+		}
+	}
+
+	func(conmgr_args, conn, func_arg);
+
+	slurm_mutex_lock(&mgr.mutex);
+
+	if (slurm_conf.debug_flags & DEBUG_FLAG_CONMGR) {
+		char *flags = con_flags_string(con->flags);
+		log_flag(CONMGR, "%s: [%s] END: extracting input_fd=%d output_fd=%d tls=0x%"PRIxPTR " func=%s(0x%"PRIxPTR") flags=%s",
+			 __func__, con->name, input_fd, output_fd,
+			 (uintptr_t) conn, func_name, (uintptr_t) func_arg,
+			 flags);
+		xfree(flags);
+	}
+
+	/* Close connection as file descriptors are now extracted */
+	con_unset_flag(con, FLAG_WAIT_ON_EXTRACT);
+	close_con(true, con);
+
+	slurm_mutex_unlock(&mgr.mutex);
+
+	return;
+
+failed:
+	if (slurm_conf.debug_flags & DEBUG_FLAG_CONMGR) {
+		char *flags = con_flags_string(con->flags);
+		log_flag(CONMGR, "%s: [%s] FAILED: extracting input_fd=%d output_fd=%d tls=0x%"PRIxPTR " func=%s(0x%"PRIxPTR") flags=%s",
+			 __func__, con->name,
+			 ((input_fd > 0) ? input_fd : con->input_fd),
+			 ((output_fd > 0) ? output_fd : con->output_fd),
+			 (uintptr_t) (conn ? conn : con->tls),
+			 con->on_extract.func_name,
+			 (uintptr_t) con->on_extract.func_arg, flags);
+		xfree(flags);
+	}
+
+	con_unset_flag(con, FLAG_WAIT_ON_EXTRACT);
+	close_con(true, con);
+	slurm_mutex_unlock(&mgr.mutex);
+
+	/* Close file descriptors if they were extracted */
+	if (!conn) {
+		fd_close(&input_fd);
+		fd_close(&output_fd);
+	}
+	FREE_NULL_CONN(conn);
+
+	/* Always set failed as cancelled */
+	conmgr_args.status = CONMGR_WORK_STATUS_CANCELLED;
+
+	/* Notify requester that extract failed */
+	func(conmgr_args, NULL, func_arg);
+}
+
+extern int conmgr_queue_extract_con_fd(conmgr_fd_t *con,
+				       conmgr_extract_fd_func_t func,
+				       const char *func_name, void *func_arg)
+{
+	xassert(con);
+	xassert(func);
+	if (!con || !func)
+		return EINVAL;
+
+	slurm_mutex_lock(&mgr.mutex);
+	xassert(con->magic == MAGIC_CON_MGR_FD);
+	xassert(!con_flag(con, FLAG_WAIT_ON_EXTRACT));
+	xassert(!con->on_extract.func);
+	xassert(!con->on_extract.func_name);
+	xassert(!con->on_extract.func_arg);
+
+	/* Disable all polling for this connection */
+	con_set_polling(con, PCTL_TYPE_NONE, __func__);
+
+	/* Set extract state on connectoin */
+	con->on_extract.func = func;
+	con->on_extract.func_name = func_name;
+	con->on_extract.func_arg = func_arg;
+
+	handle_connection(true, con);
+	slurm_mutex_unlock(&mgr.mutex);
+
+	return SLURM_SUCCESS;
 }
 
 static int _unquiesce_fd(conmgr_fd_t *con)
@@ -1572,6 +1954,23 @@ extern int conmgr_unquiesce_fd(conmgr_fd_t *con)
 	slurm_mutex_unlock(&mgr.mutex);
 
 	return rc;
+}
+
+extern bool conmgr_con_is_quiesced(conmgr_fd_ref_t *con)
+{
+	bool quiesced;
+
+	if (!con || !con->con)
+		return false;
+
+	xassert(con->magic == MAGIC_CON_MGR_FD_REF);
+	xassert(con->con->magic == MAGIC_CON_MGR_FD);
+
+	slurm_mutex_lock(&mgr.mutex);
+	quiesced = con_flag(con->con, FLAG_QUIESCE);
+	slurm_mutex_unlock(&mgr.mutex);
+
+	return quiesced;
 }
 
 static int _quiesce_fd(conmgr_fd_t *con)
@@ -1609,6 +2008,12 @@ extern int conmgr_quiesce_fd(conmgr_fd_t *con)
 	return rc;
 }
 
+static bool _is_output_open(conmgr_fd_t *con)
+{
+	xassert(con->magic == MAGIC_CON_MGR_FD);
+	return (!con_flag(con, FLAG_READ_EOF) && (con->output_fd >= 0));
+}
+
 extern bool conmgr_fd_is_output_open(conmgr_fd_t *con)
 {
 	bool open;
@@ -1616,14 +2021,26 @@ extern bool conmgr_fd_is_output_open(conmgr_fd_t *con)
 	xassert(con->magic == MAGIC_CON_MGR_FD);
 
 	slurm_mutex_lock(&mgr.mutex);
-	open = (con->output_fd >= 0);
+	open = _is_output_open(con);
 	slurm_mutex_unlock(&mgr.mutex);
 
 	return open;
 }
 
-/* caller must hold mgr.mutex */
-static conmgr_fd_ref_t *_fd_new_ref(conmgr_fd_t *con)
+extern bool conmgr_con_is_output_open(conmgr_fd_ref_t *ref)
+{
+	bool open;
+
+	xassert(ref->magic == MAGIC_CON_MGR_FD_REF);
+
+	slurm_mutex_lock(&mgr.mutex);
+	open = _is_output_open(ref->con);
+	slurm_mutex_unlock(&mgr.mutex);
+
+	return open;
+}
+
+extern conmgr_fd_ref_t *fd_new_ref(conmgr_fd_t *con)
 {
 	conmgr_fd_ref_t *ref;
 
@@ -1650,13 +2067,26 @@ extern conmgr_fd_ref_t *conmgr_fd_new_ref(conmgr_fd_t *con)
 		fatal_abort("con must not be null");
 
 	slurm_mutex_lock(&mgr.mutex);
-	ref = _fd_new_ref(con);
+	ref = fd_new_ref(con);
 	slurm_mutex_unlock(&mgr.mutex);
 
 	return ref;
 }
 
-static void _fd_free_ref(conmgr_fd_ref_t **ref_ptr)
+extern conmgr_fd_ref_t *conmgr_con_link(conmgr_fd_ref_t *con)
+{
+	conmgr_fd_ref_t *ref = NULL;
+
+	xassert(con);
+
+	slurm_mutex_lock(&mgr.mutex);
+	ref = fd_new_ref(con->con);
+	slurm_mutex_unlock(&mgr.mutex);
+
+	return ref;
+}
+
+extern void fd_free_ref(conmgr_fd_ref_t **ref_ptr)
 {
 	conmgr_fd_ref_t *ref = *ref_ptr;
 	conmgr_fd_t *con = ref->con;
@@ -1669,8 +2099,10 @@ static void _fd_free_ref(conmgr_fd_ref_t **ref_ptr)
 	xassert(con->refs >= 0);
 
 	ref->magic = ~MAGIC_CON_MGR_FD_REF;
-	xfree(ref);
-	*ref_ptr = NULL;
+	xfree((*ref_ptr));
+
+	if (!con->refs)
+		EVENT_SIGNAL(&mgr.watch_sleep);
 }
 
 extern void conmgr_fd_free_ref(conmgr_fd_ref_t **ref_ptr)
@@ -1684,29 +2116,241 @@ extern void conmgr_fd_free_ref(conmgr_fd_ref_t **ref_ptr)
 		return;
 
 	slurm_mutex_lock(&mgr.mutex);
-	_fd_free_ref(ref_ptr);
+	fd_free_ref(ref_ptr);
 	slurm_mutex_unlock(&mgr.mutex);
 }
 
-extern conmgr_fd_t *conmgr_fd_get_ref(conmgr_fd_ref_t *ref)
+extern conmgr_fd_t *fd_get_ref(conmgr_fd_ref_t *ref)
 {
-	conmgr_fd_t *con = NULL;
-
 	if (!ref)
 		return NULL;
 
 	xassert(ref->magic == MAGIC_CON_MGR_FD_REF);
 	xassert(ref->con);
 
-	con = ref->con;
+	return ref->con;
+}
+
+extern conmgr_fd_t *conmgr_fd_get_ref(conmgr_fd_ref_t *ref)
+{
+	conmgr_fd_t *con = fd_get_ref(ref);
 
 #ifndef NDEBUG
-	slurm_mutex_lock(&mgr.mutex);
-	xassert(con->magic == MAGIC_CON_MGR_FD);
-	xassert(con->refs < INT_MAX);
-	xassert(con->refs > 0);
-	slurm_mutex_unlock(&mgr.mutex);
+	if (con) {
+		slurm_mutex_lock(&mgr.mutex);
+		xassert(con->magic == MAGIC_CON_MGR_FD);
+		xassert(con->refs < INT_MAX);
+		xassert(con->refs > 0);
+		slurm_mutex_unlock(&mgr.mutex);
+	}
 #endif
 
 	return con;
+}
+
+extern bool conmgr_fd_is_tls(conmgr_fd_ref_t *ref)
+{
+	conmgr_fd_t *con = fd_get_ref(ref);
+	bool tls = false;
+
+	xassert(con);
+
+	slurm_mutex_lock(&mgr.mutex);
+	xassert(con->magic == MAGIC_CON_MGR_FD);
+	tls = (con_flag(con, FLAG_TLS_CLIENT) ||
+	       con_flag(con, FLAG_TLS_SERVER));
+	slurm_mutex_unlock(&mgr.mutex);
+
+	return tls;
+}
+
+extern int conmgr_con_get_events(conmgr_fd_ref_t *ref,
+				 const conmgr_events_t **events_ptr,
+				 void **arg_ptr)
+{
+	if (!ref)
+		return EINVAL;
+
+	slurm_mutex_lock(&mgr.mutex);
+
+	xassert(events_ptr);
+	xassert(!*events_ptr);
+	xassert(arg_ptr);
+	xassert(!*arg_ptr);
+
+	xassert(ref->magic == MAGIC_CON_MGR_FD_REF);
+	xassert(ref->con->magic == MAGIC_CON_MGR_FD);
+
+	*events_ptr = ref->con->events;
+	*arg_ptr = ref->con->arg;
+
+	slurm_mutex_unlock(&mgr.mutex);
+
+	return SLURM_SUCCESS;
+}
+
+extern int conmgr_con_set_events(conmgr_fd_ref_t *ref,
+				 const conmgr_events_t *events, void *arg,
+				 const char *caller)
+{
+	int rc = EINVAL;
+
+	if (!ref || !ref->con)
+		return rc;
+
+	slurm_mutex_lock(&mgr.mutex);
+
+	xassert(events);
+
+	xassert(ref->magic == MAGIC_CON_MGR_FD_REF);
+	xassert(ref->con->magic == MAGIC_CON_MGR_FD);
+
+	/* Reject changing connections in process of cleaning up */
+	if ((ref->con->input_fd >= 0) || (ref->con->output_fd >= 0)) {
+		log_flag(CONMGR, "%s->%s: [%s] changing events:0x%"PRIxPTR"->0x%"PRIxPTR" arg:0x%"PRIxPTR"->0x%"PRIxPTR,
+			 caller, __func__, ref->con->name,
+			 (uintptr_t) ref->con->events, (uintptr_t) events,
+			 (uintptr_t) ref->con->arg, (uintptr_t) arg);
+
+		ref->con->events = events;
+		ref->con->arg = arg;
+		rc = SLURM_SUCCESS;
+	} else {
+		log_flag(CONMGR, "%s->%s: [%s] rejecting changing events:0x%"PRIxPTR"->0x%"PRIxPTR" arg:0x%"PRIxPTR"->0x%"PRIxPTR" for closed connection",
+			 caller, __func__, ref->con->name,
+			 (uintptr_t) ref->con->events, (uintptr_t) events,
+			 (uintptr_t) ref->con->arg, (uintptr_t) arg);
+
+		rc = ESHUTDOWN;
+	}
+
+	slurm_mutex_unlock(&mgr.mutex);
+
+	return rc;
+}
+
+#define MAGIC_LIST_BUFFER_STATS 0x4aa19f2f
+
+typedef struct {
+	int magic; /* MAGIC_LIST_BUFFER_STATS */
+	int size; /* total number of bytes in list of buffers */
+	int offset; /* total of offsets in each buffer */
+} list_buffer_stats_t;
+
+static int _foreach_count_buffer(void *x, void *arg)
+{
+	buf_t *buf = x;
+	list_buffer_stats_t *out_stats = arg;
+
+	xassert(buf->magic == BUF_MAGIC);
+	xassert(out_stats->magic == MAGIC_LIST_BUFFER_STATS);
+
+	out_stats->offset += get_buf_offset(buf);
+	out_stats->size += size_buf(buf);
+
+	return SLURM_SUCCESS;
+}
+
+static int _foreach_log_work(void *x, void *arg)
+{
+	const work_t *work = x;
+	log_con_work_args_t *args = arg;
+	char str[PRINTF_WORK_CHARS];
+
+	xassert(args->magic == MAGIC_CON_LOG_WORK_ARGS);
+	xassert(work->magic == MAGIC_WORK);
+
+	/* logging connection would be redundant */
+	printf_work(work, str, sizeof(str), false);
+
+	info("%s[%d]: %s", args->type, args->index, str);
+
+	args->index++;
+
+	return SLURM_SUCCESS;
+}
+
+static int _foreach_log_connection(void *x, void *arg)
+{
+	conmgr_fd_t *con = x;
+	list_buffer_stats_t out_stats = {
+		.magic = MAGIC_LIST_BUFFER_STATS,
+	};
+	list_buffer_stats_t tls_out_stats = {
+		.magic = MAGIC_LIST_BUFFER_STATS,
+	};
+	char last_read[CTIME_STR_LEN] = "", *last_read_delim = "";
+	char last_write[CTIME_STR_LEN] = "", *last_write_delim = "";
+	char *flags = NULL;
+
+	xassert(con->magic == MAGIC_CON_MGR_FD);
+
+	flags = con_flags_string(con->flags);
+
+	if (con->last_read.tv_sec) {
+		last_read_delim = "@";
+		timespec_ctime(con->last_read, true, last_read,
+			       sizeof(last_read));
+	}
+	if (con->last_write.tv_sec) {
+		last_write_delim = "@";
+		timespec_ctime(con->last_write, true, last_write,
+			       sizeof(last_write));
+	}
+
+	if (con->out)
+		(void) list_for_each_ro(con->out, _foreach_count_buffer,
+					&out_stats);
+	if (con->tls_out)
+		(void) list_for_each_ro(con->tls_out, _foreach_count_buffer,
+					&tls_out_stats);
+
+	info("connection: [%s]+%d flags=%s type=%s input_fd=%d output_fd=%d address=%pA TLS=%c tls_input_buffer=%d/%d tls_output_buffer=%d/%d[%d] input_buffer=%d/%d%s%s output_buffers=%d/%d[%d]%s%s mss=%d extracting=%c polling=%s/%s",
+	     con->name, con->refs, flags, conmgr_con_type_string(con->type),
+	     con->input_fd, con->output_fd, &con->address,
+	     BOOL_CHARIFY(con->tls),
+	     (con->tls_in ? get_buf_offset(con->tls_in) : 0),
+	     (con->tls_in ? size_buf(con->tls_in) : 0), tls_out_stats.offset,
+	     tls_out_stats.size, (con->tls_out ? list_count(con->tls_out) : 0),
+	     (con->in ? get_buf_offset(con->in) : 0),
+	     (con->in ?  size_buf(con->in) : 0), last_read_delim, last_read,
+	     out_stats.offset, out_stats.size,
+	     (con->out ? list_count(con->out) : 0), last_write_delim,
+	     last_write, (con->mss == NO_VAL ? 0 : con->mss),
+	     BOOL_CHARIFY(con->on_extract.func),
+	     pollctl_type_to_string(con->polling_input_fd),
+	     pollctl_type_to_string(con->polling_output_fd));
+
+	xfree(flags);
+
+	if (con->work) {
+		log_con_work_args_t args = {
+			.magic = MAGIC_CON_LOG_WORK_ARGS,
+			.type = "work",
+		};
+
+		(void) list_for_each_ro(con->work, _foreach_log_work, &args);
+	}
+	if (con->write_complete_work) {
+		log_con_work_args_t args = {
+			.magic = MAGIC_CON_LOG_WORK_ARGS,
+			.type = "write_complete_work",
+		};
+
+		(void) list_for_each_ro(con->write_complete_work,
+					_foreach_log_work, &args);
+	}
+
+	return SLURM_SUCCESS;
+}
+
+extern void conmgr_log_connections(void)
+{
+	info("connections:%d/%d listeners:%d complete:%d",
+	      list_count(mgr.connections), mgr.max_connections,
+	      list_count(mgr.listen_conns), list_count(mgr.complete_conns));
+
+	(void) list_for_each_ro(mgr.listen_conns, _foreach_log_connection,
+				NULL);
+	(void) list_for_each_ro(mgr.connections, _foreach_log_connection, NULL);
 }

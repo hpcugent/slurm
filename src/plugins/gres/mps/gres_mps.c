@@ -39,7 +39,6 @@
 
 #include <ctype.h>
 #include <inttypes.h>
-#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -99,13 +98,12 @@ extern int init(void)
 
 	return SLURM_SUCCESS;
 }
-extern int fini(void)
+
+extern void fini(void)
 {
 	debug("unloading");
 	FREE_NULL_LIST(gres_devices);
 	gres_c_s_fini();
-
-	return SLURM_SUCCESS;
 }
 
 /*

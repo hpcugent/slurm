@@ -925,7 +925,7 @@ static void *_thread_ipmi_run(void *no_data)
 
 static void *_thread_launcher(void *no_data)
 {
-	//what arg would countain? frequency, socket?
+	//what arg would contain? frequency, socket?
 	struct timeval tvnow;
 	struct timespec abs;
 
@@ -948,13 +948,16 @@ static void *_thread_launcher(void *no_data)
 
 		/*
 		 * It is a known thing we can hang up on IPMI calls cancel if
-		 * we must.
+		 * we must. This might not be safe if we're stuck in the driver
+		 * and have some glibc lock locked. We will cancel the thread
+		 * but maybe we will end up deadlocked. This is a best effort.
 		 */
 		pthread_cancel(thread_ipmi_id_run);
 
 		/*
 		 * Unlock just to make sure since we could have canceled the
-		 * thread while in the lock.
+		 * thread while in the lock. This demonstrates how dangerous
+		 * it is to cancel a thread at random points in the code.
 		 */
 		slurm_mutex_unlock(&ipmi_mutex);
 	}
@@ -1178,10 +1181,6 @@ static void _get_node_energy(acct_gather_energy_t *energy, uint16_t sensor_cnt)
 	energy->slurmd_start_time = slurmd_start_time;
 }
 
-/*
- * init() is called when the plugin is loaded, before any other functions
- * are called.  Put global initialization here.
- */
 extern int init(void)
 {
 	/* put anything that requires the .conf being read in
@@ -1191,12 +1190,12 @@ extern int init(void)
 	return SLURM_SUCCESS;
 }
 
-extern int fini(void)
+extern void fini(void)
 {
 	uint16_t i;
 
 	if (!running_in_slurmd_stepd())
-		return SLURM_SUCCESS;
+		return;
 
 	flag_energy_accounting_shutdown = true;
 
@@ -1241,7 +1240,6 @@ extern int fini(void)
 	descriptions_len = 0;
 
 	flag_init = false;
-	return SLURM_SUCCESS;
 }
 
 extern int acct_gather_energy_p_update_node_energy(void)

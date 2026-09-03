@@ -24,7 +24,7 @@ configuration used.</p>
 
 <p>Several system configuration parameters may require modification to support a large number
 of open files and TCP connections with large bursts of messages. Changes can
-be made using the <b>/etc/rc.d/rc.local</b> or <b>/etc/sysctl.conf</b> 
+be made using the <b>/etc/rc.d/rc.local</b> or <b>/etc/sysctl.conf</b>
 script to preserve changes after reboot. In either case, you can write values
 directly into these files
 (e.g. <i>"echo 32832 &gt; /proc/sys/fs/file-max"</i>).</p>
@@ -54,8 +54,9 @@ The default value of 5, which results in a timeout of passive TCP connections
 of approximately 180 seconds and is generally satisfactory.
 <li><b>/proc/sys/net/core/somaxconn</b>:
 Limit of socket listen() backlog, known in userspace as SOMAXCONN. Defaults to
-128. The value should be raised substantially to support bursts of request.
-For example, to support a burst of 1024 requests, set somaxconn to 1024.</li>
+128 or more depending on OS version. Sites should consider a minimum value of
+4096 or 8192, or a higher value that is greater the sum of all nodes plus all
+active clients in the cluster.</li>
 <li><b>/proc/sys/net/ipv4/ip_local_port_range</b>:
 Identify the ephemeral ports available, which are used for many Slurm
 communications. The value may be raised to support a high volume of
@@ -224,16 +225,20 @@ available hardware CPUs, increasing the potential for thread starvation. While
 processing incoming RPC requests, slurmctld usually has to obtain one or
 more of the global slurmctld locks. Each thread attempting to obtain a lock can
 cause increased contention with the scheduler threads. Lock contention will
-result in the job scheduler running slower or with non-neglible delays.
+result in the job scheduler running slower or with noticeable delays, and
+increase the average time per RPC.
 Sites wishing for more RPC throughput can increase <b>conmgr_threads</b> from
 the defaults, while sites wishing to prioritize scheduler threads can decrease
-the thread count. Sites are advised to monitor for changes in
-<code>sdiag</code>'s job start statistics when changing this parameter.
-<b>conmgr_threads</b> should at least be between 2-4 times the number of
-hardware CPU threads available to slurmctld daemon due to most RPC processing
-needing to wait on global locks. Increasing <b>conmgr_threads</b> too much
-could cause an <i>Out of Memory</i> event which will cause slurmctld to
-crash, potentially losing jobs and accounting.
+the thread count. We recommend trying to modify <b>conmgr_max_connections</b>
+and the <b>SchedulerParameters</b> to get the performance you want, before
+attempting to change <b>conmgr_threads</b>.
+You should monitor for changes in <code>sdiag</code>'s job start statistics
+when changing this parameter. In most cases, sites should consider reducing
+<b>conmgr_threads</b> instead of adding more threads, as having too many
+threads can cause locking overhead and cause <code>slurmctld</code> to hang.
+Increasing <b>conmgr_threads</b> also uses more memory, potentially causing an
+<i>Out of Memory</i> event for <code>slurmctld</code>, which could result in
+lost jobs and accounting.
 </li>
 </ul>
 <li><b>SchedulerType</b>:
@@ -243,12 +248,6 @@ and eliminates logic used to sort the queue by priority.
 <li><b>SlurmctldDebug</b>:
 More detailed logging will decrease system throughput. Set to <i>error</i> or
 <i>info</i> for regular operations with high throughput workload.</li>
-<li><b>SlurmctldPort</b>:
-It is desirable to configure the <b>slurmctld</b> daemon to accept incoming
-messages on more than one port in order to avoid having incoming messages
-discarded by the operating system due to exceeding the SOMAXCONN limit
-described above. Using between two and ten ports is suggested when large
-numbers of simultaneous requests are to be supported.</li>
 <li><b>SlurmdDebug</b>:
 More detailed logging will decrease system throughput. Set to <i>error</i> or
 <i>info</i> for regular operations with high throughput workload.</li>
@@ -279,20 +278,15 @@ appropriate for your environment.</li>
   requests to be accumulated and reduces the number of commit requests
   to the database.</p>
 
-<p>You might also consider setting the '<i>Purge*</i>' options in your
-  slurmdbd.conf to clear out old Data.  A Typical configuration would
-  look like this...</p>
-<ul>
-<li><b>PurgeEventAfter</b>=12months</li>
-<li><b>PurgeJobAfter</b>=12months</li>
-<li><b>PurgeResvAfter</b>=2months</li>
-<li><b>PurgeStepAfter</b>=2months</li>
-<li><b>PurgeSuspendAfter</b>=1month</li>
-<li><b>PurgeTXNAfter</b>=12months</li>
-<li><b>PurgeUsageAfter</b>=12months</li>
-
-</ul>
-
-<p style="text-align:center;">Last modified 13 March 2025</p>
+<p>High job throughput leads to the database growing much faster than in a
+  typical environment, potentially to a size that becomes difficult to manage
+  depending on the capabilities of the database server. Sites are strongly
+  encouraged to make a plan for data retention early on and to configure the
+  relevant <a href="accounting.html#slurmdbd-archive-purge">Purge options</a> to
+  keep the database files at a manageable size. Also consider the frequency of
+  these purges as explained in the linked  documentation. Alternately, sites may
+  prefer to skip the storage of steps or jobs entirely through the relevant
+  <a href="slurm.conf.html#OPT_AccountingStorageEnforce">AccountingStorageEnforce</a>
+  options (<b>nosteps</b> and <b>nojobs</b>).</p>
 
 <!--#include virtual="footer.txt"-->

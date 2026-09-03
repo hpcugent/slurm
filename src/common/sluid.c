@@ -39,6 +39,7 @@
 #include "src/common/macros.h"
 #include "src/common/sluid.h"
 #include "src/common/xmalloc.h"
+#include "src/common/xrandom.h"
 #include "src/common/xstring.h"
 
 #ifdef __linux__
@@ -90,10 +91,11 @@ extern sluid_t generate_sluid(void)
 		now_ms = last_ms;
 	}
 	sluid = seq;
-	slurm_mutex_unlock(&sluid_mutex);
 
 	sluid |= now_ms << 10;
 	sluid |= cluster_bits;
+
+	slurm_mutex_unlock(&sluid_mutex);
 
 	return sluid;
 }
@@ -101,33 +103,42 @@ extern sluid_t generate_sluid(void)
 extern uint16_t generate_cluster_id(void)
 {
 	/* Cluster IDs must be between 2 and 4095. */
-	static bool seeded = false;
-	if (!seeded) {
-		srandom(time(NULL) + getpid());
-		seeded = true;
-	}
-	return (random() % (4096 - 2)) + 2;
+	return (xrandom() % (4096 - 2)) + 2;
 }
 
 extern char *sluid2str(const sluid_t sluid)
 {
 	char *str = xmalloc(15);
-	str[0] = 's';
+	print_sluid(sluid, str, 15);
+	return str;
+}
+
+extern void print_sluid(const sluid_t sluid, char *buffer, size_t size)
+{
+	if (size < 15)
+		return;
+
+	buffer[0] = 's';
+	buffer[14] = '\0';
 
 	for (int i = 0; i < 13; i++) {
 		uint64_t shift = 5 * i;
+		/*
+		 * The shift beyond the 64 bits here is intentional. This is
+		 * chopping it into 5-bit pieces, but the top 4-bits still
+		 * need to be translated. So the shift does overflow,
+		 * but it doesn't matter since we are only looking at bits.
+		 */
 		uint64_t mask = (uint64_t) 0x1f << shift;
-		str[13 - i] = cb32map[(sluid & mask) >> shift];
+		buffer[13 - i] = cb32map[(sluid & mask) >> shift];
 	}
-
-	return str;
 }
 
 extern sluid_t str2sluid(const char *string)
 {
 	sluid_t sluid = 0;
 
-	if (strlen(string) != 14)
+	if (!string || (strlen(string) != 14))
 		return 0;
 
 	if (string[0] != 's' && string[0] != 'S')

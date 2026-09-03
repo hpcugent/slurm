@@ -94,18 +94,14 @@ const char plugin_name[]      = "Process tracking via process group ID plugin";
 const char plugin_type[]      = "proctrack/pgid";
 const uint32_t plugin_version = SLURM_VERSION_NUMBER;
 
-/*
- * init() is called when the plugin is loaded, before any other functions
- * are called.  Put global initialization here.
- */
-extern int init ( void )
+extern int init(void)
 {
 	return SLURM_SUCCESS;
 }
 
-extern int fini ( void )
+extern void fini(void)
 {
-	return SLURM_SUCCESS;
+	return;
 }
 
 extern int proctrack_p_create(stepd_step_rec_t *step)
@@ -192,6 +188,11 @@ proctrack_p_wait(uint64_t cont_id)
 	return SLURM_SUCCESS;
 }
 
+extern int proctrack_p_wait_for_any_task(int *status, bool block,
+					 struct rusage *rusage)
+{
+	return ESLURM_NOT_SUPPORTED;
+}
 
 /*
  * Get list of all PIDs belonging to process group cont_id

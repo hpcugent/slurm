@@ -337,12 +337,16 @@ Slurm should work normally.</p>
 task) which use cgroup, call init() function of cgroup/v2 plugin. What happens
 immediately is that slurmd does a call to dbus using libdbus, and creates
 a new systemd "Scope". The scope name is predefined and set depending on an
-internal constant SYSTEM_CGSCOPE under SYSTEM_CGSLICE. It basically ends up
-with the name "slurmstepd.scope" or "nodename_slurmstepd.scope" depending on
-whether Slurm is compiled with <i>--enable-multiple-slurmd</i> (prefixes node
-name) or not. The cgroup directory associated with this scope will be fixed as:
+internal constant SYSTEM_CGSCOPE. This constant name is either
+"slurmstepd.scope" or "nodename_slurmstepd.scope" depending on whether Slurm was
+compiled with <i>--enable-multiple-slurmd</i> (prefixes node name) or not. By
+default, this scope will be placed under system.slice and the cgroup directory
+associated with this scope will be:
 "/sys/fs/cgroup/system.slice/slurmstepd.scope" or
 "/sys/fs/cgroup/system.slice/nodename_slurmstepd.scope".
+The slice can be changed by specifying the "Slice=" property under the
+[Service] section of the slurmd.service unit file and adding the CgroupSlice
+parameter in the cgroup.conf file.
 </p>
 <p>Since the call to dbus "startTransientUnit" requires a pid as a parameter,
 slurmd needs to fork a "slurmstepd infinity" and use this parameter as the
@@ -480,7 +484,7 @@ slurmd: error: cannot create jobacct_gather context for jobacct_gather/cgroup
 slurmd: fatal: Unable to initialize jobacct_gather
 </pre>
 
-<p>One workaround is to set <i>EnableControllers=yes</i> in slurm.conf, but
+<p>One workaround is to set <i>EnableControllers=yes</i> in cgroup.conf, but
 note that this won't save you from possibly having other processes have OOM
 errors, as mentioned previously. Moreover, that will modify your entire cgroup
 tree from the root <i>/sys/fs/cgroup</i>. So the real solution is to either
@@ -771,8 +775,11 @@ MaxVMSize, MaxVMSizeNode, MaxVMSizeTask</i> and <i>vmem</i> in
 with <i>cgroup/v2</i>.</p>
 <p>In what regards to real stack size (RSS), this plugin provides cgroup's
 <i>memory.current</i> value from the memory interface, which is not equal to the
-RSS value provided by procfs. Nevertheless it is the same value that the kernel
-uses in its OOM killer logic.
+RSS value provided by procfs. Note that the file cache (active_file and
+inactive_file in memory.stat) is counted toward RSS and MaxRSS unless
+<i>JobAcctGatherParams=no_file_cache</i> is set. When that option is used,
+MaxRSS no longer relies on memory.peak, so brief memory spikes may go unnoticed
+if they occur between <i>JobAcctGatherFrequency</i> intervals.
 </p>
 
 <p>RHEL8 / Rocky8: According to its release notes, support for cgroups v2
@@ -790,6 +797,5 @@ The cpu controller can be enabled in system.conf by setting
 <code>DefaultCpuAccounting=yes</code>. For the cpuset controller, you need to
 set <code>EnableControllers=yes</code> in cgroup.conf.
 </p>
-<p style="text-align:center;">Last modified 11 October 2024</p>
 
 <!--#include virtual="footer.txt"-->

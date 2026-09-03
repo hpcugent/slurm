@@ -43,7 +43,7 @@
  *  DEPENDENCY		Original list of jobids dependencies
  *  DERIVED_EC		Derived exit code and after : the signal number (if any)
  *  END			Time of job termination, UTS
- *  ELIGIBLE		Eligble time of job, UTS
+ *  ELIGIBLE		Eligible time of job, UTS
  *  EXITCODE		Job's exit code and after : the signal number (if any)
  *  GID			Group ID of job owner
  *  GROUPNAME		Group name of job owner
@@ -188,8 +188,11 @@ struct jobcomp_info {
 
 static struct jobcomp_info *_jobcomp_info_create(job_record_t *job)
 {
+	char *partition = NULL;
 	enum job_states state;
 	struct jobcomp_info *j = xmalloc(sizeof(struct jobcomp_info));
+
+	partition = job->part_ptr ? job->part_ptr->name : job->partition;
 
 	j->jobid = job->job_id;
 	j->exit_code = job->exit_code;
@@ -247,7 +250,7 @@ static struct jobcomp_info *_jobcomp_info_create(job_record_t *job)
 		j->end = job->end_time;
 	}
 
-	j->partition = xstrdup (job->partition);
+	j->partition = xstrdup(partition);
 	if ((job->time_limit == NO_VAL) && job->part_ptr)
 		j->limit = job->part_ptr->max_time;
 	else
@@ -593,10 +596,6 @@ static void * _script_agent (void *args)
 	return NULL;
 }
 
-/*
- * init() is called when the plugin is loaded, before any other functions
- * are called.  Put global initialization here.
- */
 extern int init(void)
 {
 	verbose("jobcomp/script plugin loaded init");
@@ -634,7 +633,7 @@ extern int jobcomp_p_set_location(void)
 	return SLURM_SUCCESS;
 }
 
-extern int jobcomp_p_log_record(job_record_t *record)
+extern int jobcomp_p_record_job_end(job_record_t *record, uint32_t event)
 {
 	struct jobcomp_info * job;
 
@@ -651,8 +650,7 @@ extern int jobcomp_p_log_record(job_record_t *record)
 	return SLURM_SUCCESS;
 }
 
-/* Called when script unloads */
-extern int fini ( void )
+extern void fini(void)
 {
 	slurm_mutex_lock(&thread_flag_mutex);
 	if (script_thread) {
@@ -669,8 +667,6 @@ extern int fini ( void )
 	slurm_mutex_lock(&comp_list_mutex);
 	FREE_NULL_LIST(comp_list);
 	slurm_mutex_unlock(&comp_list_mutex);
-
-	return SLURM_SUCCESS;
 }
 
 /*
@@ -683,4 +679,9 @@ extern list_t *jobcomp_p_get_jobs(slurmdb_job_cond_t *job_cond)
 
 	info("This function is not implemented.");
 	return NULL;
+}
+
+extern int jobcomp_p_record_job_start(job_record_t *job_ptr, uint32_t event)
+{
+	return SLURM_SUCCESS;
 }

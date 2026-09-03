@@ -383,7 +383,7 @@ _get_prefix( char *token )
  * OUT field - the letter code for the data type
  * OUT field_size - byte count
  * OUT right_justify - true of field to be right justified
- * OUT suffix - string containing everthing after the field specification
+ * OUT suffix - string containing everything after the field specification
  */
 static void
 _parse_token( char *token, char *field, int *field_size, bool *right_justify,
@@ -466,7 +466,7 @@ static list_t *_build_job_list(char *str)
 	job = strtok_r(my_job_list, ",", &tmp_char);
 	while (job) {
 		slurm_selected_step_t sel_step;
-		if (unfmt_job_id_string(str, &sel_step, NO_VAL)) {
+		if (unfmt_job_id_string(job, &sel_step, NO_VAL)) {
 			error("Invalid job id: %s", job);
 			exit(1);
 		} else if (sel_step.het_job_offset != NO_VAL)
@@ -525,7 +525,7 @@ static list_t *_build_user_list(char *str)
 	my_user_list = xstrdup(str);
 	user = strtok_r(my_user_list, ",", &tmp_char);
 	while (user) {
-		if (uid_from_string(user, &uid) < 0) {
+		if (uid_from_string(user, &uid) != SLURM_SUCCESS) {
 			error("Invalid user: %s\n", user);
 		} else {
 			uint32_t *u_tmp = xmalloc(sizeof( uint32_t ));

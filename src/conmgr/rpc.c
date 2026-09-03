@@ -37,6 +37,7 @@
 
 #include "slurm/slurm_errno.h"
 
+#include "src/common/forward.h"
 #include "src/common/slurm_protocol_api.h"
 #include "src/common/pack.h"
 #include "src/common/read_config.h"
@@ -48,6 +49,7 @@
 
 #include "src/conmgr/conmgr.h"
 #include "src/conmgr/mgr.h"
+#include "src/conmgr/tls.h"
 
 static int _try_parse_rpc(conmgr_fd_t *con, slurm_msg_t **msg_ptr)
 {
@@ -99,16 +101,38 @@ static int _try_parse_rpc(conmgr_fd_t *con, slurm_msg_t **msg_ptr)
 				msglen);
 	msg = xmalloc(sizeof(*msg));
 	slurm_msg_t_init(msg);
-	msg->conmgr_fd = con;
+	msg->conmgr_con = conmgr_fd_new_ref(con);
 	memcpy(&msg->address, &con->address, sizeof(con->address));
 
 	log_flag_hex(NET_RAW, get_buf_data(rpc), size_buf(rpc),
 		     "%s: [%s] unpacking RPC", __func__, con->name);
 
-	if ((rc = slurm_unpack_received_msg(msg, con->input_fd, rpc))) {
-		log_flag(NET, "%s: [%s] slurm_unpack_received_msg() failed: %s",
+	if (con_flag(con, FLAG_RPC_RECV_FORWARD)) {
+		if ((rc = slurm_unpack_msg_and_forward(msg, &msg->address,
+						       con->input_fd, rpc))) {
+			/*
+			 * if this fails we need to make sure the nodes we
+			 * forward to are taken care of and sent back. This way
+			 * the control also has a better idea what happened to
+			 * us.
+			 */
+			if (msg->auth_ids_set)
+				slurm_send_rc_msg(msg, rc);
+			else {
+				debug("%s: incomplete message", __func__);
+				forward_wait(msg);
+			}
+			log_flag(NET, "%s: [%s] slurm_unpack_msg_and_forward() failed: %s",
 			 __func__, con->name, slurm_strerror(rc));
+		}
+	} else {
+		if ((rc = slurm_unpack_received_msg(msg, con->input_fd, rpc))) {
+			log_flag(NET, "%s: [%s] slurm_unpack_received_msg() failed: %s",
+			 __func__, con->name, slurm_strerror(rc));
+		}
+	}
 
+	if (rc) {
 		/*
 		 * Always close input_fd on failure as it is not possible to
 		 * safely parse another incoming rpc on this connection.
@@ -129,6 +153,9 @@ static int _try_parse_rpc(conmgr_fd_t *con, slurm_msg_t **msg_ptr)
 			msg->flags |= SLURM_MSG_KEEP_BUFFER;
 			set_buf_offset(msg->buffer, size_buf(rpc));
 		}
+
+		if (con->tls)
+			msg->conn_is_mtls = tls_is_client_authenticated(con);
 
 		/* notify conmgr we processed some data successfully */
 		set_buf_offset(con->in, need);
@@ -172,10 +199,30 @@ extern int on_rpc_connection_data(conmgr_fd_t *con, void *arg)
 	return rc;
 }
 
+extern int conmgr_queue_write_msg(conmgr_fd_t *con, slurm_msg_t *msg)
+{
+	xassert(con->magic == MAGIC_CON_MGR_FD);
+	xassert(msg);
+
+	return write_msg(con, msg);
+}
+
+extern int conmgr_con_queue_write_msg(conmgr_fd_ref_t *ref, slurm_msg_t *msg)
+{
+	if (!ref)
+		return EINVAL;
+
+	xassert(ref->magic == MAGIC_CON_MGR_FD_REF);
+	xassert(ref->con->magic == MAGIC_CON_MGR_FD);
+	xassert(msg);
+
+	return write_msg(ref->con, msg);
+}
+
 /*
  * based on _pack_msg() and slurm_send_node_msg() in slurm_protocol_api.c
  */
-extern int conmgr_queue_write_msg(conmgr_fd_t *con, slurm_msg_t *msg)
+extern int write_msg(conmgr_fd_t *con, slurm_msg_t *msg)
 {
 	int rc;
 	msg_bufs_t buffers = {0};

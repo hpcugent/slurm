@@ -130,6 +130,31 @@ static uint64_t _get_db_index(mysql_conn_t *mysql_conn,
 	return db_index;
 }
 
+/*
+ * Check if the job record exists in the database by db_index.
+ */
+static bool _job_db_index_exists(mysql_conn_t *mysql_conn, uint64_t db_index)
+{
+	MYSQL_RES *result = NULL;
+	bool exists = false;
+	char *query = NULL;
+
+	if (!db_index)
+		return false;
+
+	query = xstrdup_printf("select job_db_inx from \"%s_%s\" where "
+			       "job_db_inx=%" PRIu64,
+			       mysql_conn->cluster_name, job_table, db_index);
+
+	if ((result = mysql_db_query_ret(mysql_conn, query, 0))) {
+		exists = (mysql_fetch_row(result) != NULL);
+		mysql_free_result(result);
+	}
+	xfree(query);
+
+	return exists;
+}
+
 static char *_get_user_from_associd(mysql_conn_t *mysql_conn,
 				    char *cluster, uint32_t associd)
 {
@@ -338,6 +363,22 @@ static uint64_t _get_hash_inx(mysql_conn_t *mysql_conn,
 
 }
 
+static int _create_tres_replace_str(void *x, void *args)
+{
+	slurmdb_tres_rec_t *tres_rec = x;
+	char **vals = args;
+
+	/*
+	 * If we already have the tres we are looking for we will replace it
+	 * with the new value, otherwise we will just tack it onto the end.
+	 */
+	xstrfmtcat(*vals, ", tres_alloc=case when tres_alloc regexp '(^|,)%u=' then regexp_replace(tres_alloc, '(^|,)(%u)=[[:digit:]]+', '\\\\1\\\\2=%"PRIu64"') else concat_ws(',', tres_alloc, '%u=%"PRIu64"') end",
+		   tres_rec->id, tres_rec->id, tres_rec->count,
+		   tres_rec->id, tres_rec->count);
+
+	return 0;
+}
+
 /* extern functions */
 
 extern int as_mysql_job_start(mysql_conn_t *mysql_conn, job_record_t *job_ptr)
@@ -408,11 +449,9 @@ extern int as_mysql_job_start(mysql_conn_t *mysql_conn, job_record_t *job_ptr)
 	else
 		check_time = submit_time;
 
-	slurm_mutex_lock(&rollup_lock);
-	if (check_time < global_last_rollup) {
-		MYSQL_ROW row;
-
-		/* check to see if we are hearing about this time for the
+	if (trigger_reroll(mysql_conn, check_time)) {
+		/*
+		 * Check to see if we are hearing about this time for the
 		 * first time.
 		 */
 		query = xstrdup_printf("select job_db_inx "
@@ -423,63 +462,29 @@ extern int as_mysql_job_start(mysql_conn_t *mysql_conn, job_record_t *job_ptr)
 				       job_table, job_ptr->job_id,
 				       submit_time, begin_time, start_time);
 		DB_DEBUG(DB_JOB, mysql_conn->conn, "query\n%s", query);
-		if (!(result =
-		      mysql_db_query_ret(mysql_conn, query, 0))) {
+		if (!(result = mysql_db_query_ret(mysql_conn, query, 0))) {
 			xfree(query);
-			slurm_mutex_unlock(&rollup_lock);
 			return SLURM_ERROR;
 		}
 		xfree(query);
-		if ((row = mysql_fetch_row(result))) {
-			mysql_free_result(result);
-			debug4("revieved an update for a "
-			       "job (%u) already known about",
+		if (mysql_fetch_row(result))
+			debug4("Received an update for a job (%u) already known about",
 			       job_ptr->job_id);
-			slurm_mutex_unlock(&rollup_lock);
-			goto no_rollup_change;
-		}
-		mysql_free_result(result);
-
-		if (job_ptr->start_time)
-			debug("Need to reroll usage from %s Job %u "
-			      "from %s started then and we are just "
-			      "now hearing about it.",
+		else if (job_ptr->start_time)
+			debug("Need to reroll usage from %s Job %u from %s started then and we are just now hearing about it.",
 			      slurm_ctime2(&check_time),
 			      job_ptr->job_id, mysql_conn->cluster_name);
 		else if (begin_time)
-			debug("Need to reroll usage from %s Job %u "
-			      "from %s became eligible then and we are just "
-			      "now hearing about it.",
+			debug("Need to reroll usage from %s Job %u from %s became eligible then and we are just now hearing about it.",
 			      slurm_ctime2(&check_time),
 			      job_ptr->job_id, mysql_conn->cluster_name);
 		else
-			debug("Need to reroll usage from %s Job %u "
-			      "from %s was submitted then and we are just "
-			      "now hearing about it.",
+			debug("Need to reroll usage from %s Job %u from %s was submitted then and we are just now hearing about it.",
 			      slurm_ctime2(&check_time),
 			      job_ptr->job_id, mysql_conn->cluster_name);
 
-		global_last_rollup = check_time;
-		slurm_mutex_unlock(&rollup_lock);
-
-		/* If the times here are later than the daily_rollup
-		   or monthly rollup it isn't a big deal since they
-		   are always shrunk down to the beginning of each
-		   time period.
-		*/
-		query = xstrdup_printf("update \"%s_%s\" set "
-				       "hourly_rollup=%ld, "
-				       "daily_rollup=%ld, monthly_rollup=%ld",
-				       mysql_conn->cluster_name,
-				       last_ran_table, check_time,
-				       check_time, check_time);
-		DB_DEBUG(DB_JOB, mysql_conn->conn, "query\n%s", query);
-		rc = mysql_db_query(mysql_conn, query);
-		xfree(query);
-	} else
-		slurm_mutex_unlock(&rollup_lock);
-
-no_rollup_change:
+		mysql_free_result(result);
+	}
 
 	if (job_ptr->name && job_ptr->name[0])
 		jname = job_ptr->name;
@@ -506,13 +511,13 @@ no_rollup_change:
 	/*
 	 * Only jobs < 24.11 will not have a db_index here. This would also be
 	 * likely the first time we have seen this.
-	 * This can be removed 3 versions after 24.11.
+	 * When 24.05 is no longer supported this can be removed.
 	 */
 	if (!job_ptr->db_index) {
 		if (!(job_ptr->db_index = _get_db_index(mysql_conn,
 							submit_time,
 							job_ptr->job_id)))
-			job_record_set_sluid(job_ptr);
+			job_record_set_sluid(job_ptr, false);
 	}
 
 	if (!IS_JOB_IN_DB(job_ptr)) {
@@ -605,6 +610,10 @@ no_rollup_change:
 			xstrcatat(query, &pos, ", container");
 		if (job_ptr->licenses)
 			xstrcatat(query, &pos, ", licenses");
+		if (job_ptr->details->segment_size)
+			xstrcatat(query, &pos, ", segment_size");
+		if (job_ptr->details->resv_req)
+			xstrcatat(query, &pos, ", resv_req");
 
 		xstrfmtcatat(query, &pos,
 			     ") values (%"PRIu64", %u, UNIX_TIMESTAMP(), "
@@ -681,6 +690,12 @@ no_rollup_change:
 		if (job_ptr->licenses)
 			xstrfmtcatat(query, &pos, ", '%s'",
 				     job_ptr->licenses);
+		if (job_ptr->details->segment_size)
+			xstrfmtcatat(query, &pos, ", %u",
+				     job_ptr->details->segment_size);
+		if (job_ptr->details->resv_req)
+			xstrfmtcatat(query, &pos, ", '%s'",
+				     job_ptr->details->resv_req);
 
 		xstrfmtcatat(query, &pos,
 			     ") on duplicate key update "
@@ -772,6 +787,12 @@ no_rollup_change:
 		if (job_ptr->licenses)
 			xstrfmtcatat(query, &pos, ", licenses='%s'",
 				     job_ptr->licenses);
+		if (job_ptr->details->segment_size)
+			xstrfmtcatat(query, &pos, ", segment_size=%u",
+				     job_ptr->details->segment_size);
+		if (job_ptr->details->resv_req)
+			xstrfmtcatat(query, &pos, ", resv_req='%s'",
+				     job_ptr->details->resv_req);
 	} else {
 		xstrfmtcatat(query, &pos,
 			     "update \"%s_%s\" set nodelist='%s', ",
@@ -838,6 +859,12 @@ no_rollup_change:
 		if (job_ptr->licenses)
 			xstrfmtcatat(query, &pos, "licenses='%s', ",
 				     job_ptr->licenses);
+		if (job_ptr->details->segment_size)
+			xstrfmtcatat(query, &pos, "segment_size=%u, ",
+				     job_ptr->details->segment_size);
+		if (job_ptr->details->resv_req)
+			xstrfmtcatat(query, &pos, "resv_req='%s', ",
+				     job_ptr->details->resv_req);
 
 		xstrfmtcatat(query, &pos, "time_start=%ld, job_name='%s', "
 			     "state=greatest(state, %u), "
@@ -966,6 +993,14 @@ extern list_t *as_mysql_modify_job(mysql_conn_t *mysql_conn, uint32_t uid,
 	if (job->extra)
 		xstrfmtcat(vals, ", extra='%s'", job->extra);
 
+	if (job->tres_alloc_str) {
+		list_t *tmp_list = NULL;
+		slurmdb_tres_list_from_string(&tmp_list, job->tres_alloc_str,
+					      TRES_STR_FLAG_NONE, NULL);
+		(void) list_for_each(tmp_list, _create_tres_replace_str, &vals);
+		FREE_NULL_LIST(tmp_list);
+	}
+
 	if (job->wckey)
 		xstrfmtcat(vals, ", wckey='%s'", job->wckey);
 
@@ -1001,6 +1036,15 @@ extern list_t *as_mysql_modify_job(mysql_conn_t *mysql_conn, uint32_t uid,
 			break;
 		}
 
+		/* If we changed the TRES we need to reroll the usage */
+		if (job->tres_alloc_str && job_rec->start) {
+			if (trigger_reroll(mysql_conn, job_rec->start)) {
+				debug("Need to reroll usage from %s Job %u from %s started then and we just changed the TRES on it.",
+				      slurm_ctime2(&job_rec->start),
+				      job_rec->jobid,
+				      mysql_conn->cluster_name);
+			}
+		}
 		slurm_make_time_str(&job_rec->submit,
 				    tmp_char, sizeof(tmp_char));
 
@@ -1185,7 +1229,7 @@ static char *_get_derived_ec_update_str(uint32_t exit_code)
 
 	/*
 	 * Sync with _internal_step_complete() for setting derived_ec on the
-	 * contoller.
+	 * controller.
 	 */
 	if (exit_code == SIG_OOM)
 		derived_str = xstrdup_printf("%u", exit_code);
@@ -1257,10 +1301,8 @@ extern int as_mysql_job_complete(mysql_conn_t *mysql_conn,
 		      job_ptr->job_id, mysql_conn->cluster_name,
 		      IS_JOB_RESIZING(job_ptr) ? "resized" : "ended");
 
-	if (!job_ptr->db_index) {
-		if (!(job_ptr->db_index =
-		      _get_db_index(mysql_conn,
-				    submit_time,
+	if (!_job_db_index_exists(mysql_conn, job_ptr->db_index)) {
+		if (!(_get_db_index(mysql_conn, submit_time,
 				    job_ptr->job_id))) {
 			/* Comment is overloaded in job_start to be
 			   the block_id, so we will need to store this
@@ -1452,28 +1494,44 @@ extern int as_mysql_step_start(mysql_conn_t *mysql_conn,
 	/* The stepid could be negative so use %d not %u */
 	query = xstrdup_printf(
 		"insert into \"%s_%s\" (job_db_inx, id_step, step_het_comp, "
-		"time_start, step_name, state, tres_alloc, "
+		"time_start, timelimit, step_name, state, tres_alloc, "
 		"nodes_alloc, task_cnt, nodelist, node_inx, "
 		"task_dist, req_cpufreq, req_cpufreq_min, req_cpufreq_gov",
 		mysql_conn->cluster_name, step_table);
 
+	if (step_ptr->cwd)
+		xstrcat(query, ", cwd");
+	if (step_ptr->std_err)
+		xstrcat(query, ", std_err");
+	if (step_ptr->std_in)
+		xstrcat(query, ", std_in");
+	if (step_ptr->std_out)
+		xstrcat(query, ", std_out");
 	if (step_ptr->submit_line)
 		xstrcat(query, ", submit_line");
 	if (step_ptr->container)
 		xstrcat(query, ", container");
 
 	xstrfmtcat(query,
-		   ") values (%"PRIu64", %d, %u, %d, '%s', %d, '%s', %d, %d, "
-		   "'%s', '%s', %d, %u, %u, %u",
+		   ") values (%"PRIu64", %d, %u, %d, %u, '%s', %d, '%s', %d, "
+		   "%d, '%s', '%s', %d, %u, %u, %u",
 		   step_ptr->job_ptr->db_index,
 		   step_ptr->step_id.step_id,
 		   step_ptr->step_id.step_het_comp,
-		   (int)start_time, step_ptr->name,
+		   (int)start_time, step_ptr->time_limit, step_ptr->name,
 		   JOB_RUNNING, step_ptr->tres_alloc_str,
 		   nodes, tasks, node_list, node_inx, task_dist,
 		   step_ptr->cpu_freq_max, step_ptr->cpu_freq_min,
 		   step_ptr->cpu_freq_gov);
 
+	if (step_ptr->cwd)
+		xstrfmtcat(query, ", '%s'", step_ptr->cwd);
+	if (step_ptr->std_err)
+		xstrfmtcat(query, ", '%s'", step_ptr->std_err);
+	if (step_ptr->std_in)
+		xstrfmtcat(query, ", '%s'", step_ptr->std_in);
+	if (step_ptr->std_out)
+		xstrfmtcat(query, ", '%s'", step_ptr->std_out);
 	if (step_ptr->submit_line)
 		xstrfmtcat(query, ", '%s'", step_ptr->submit_line);
 	if (step_ptr->container)
@@ -1481,15 +1539,23 @@ extern int as_mysql_step_start(mysql_conn_t *mysql_conn,
 
 	xstrfmtcat(query,
 		   ") on duplicate key update "
-		   "nodes_alloc=%d, task_cnt=%d, time_end=0, state=%d, "
-		   "nodelist='%s', node_inx='%s', task_dist=%d, "
+		   "nodes_alloc=%d, task_cnt=%d, time_end=0, timelimit=%u, "
+		   "state=%d, nodelist='%s', node_inx='%s', task_dist=%d, "
 		   "req_cpufreq=%u, req_cpufreq_min=%u, req_cpufreq_gov=%u,"
 		   "tres_alloc='%s'",
-		   nodes, tasks, JOB_RUNNING,
+		   nodes, tasks, step_ptr->time_limit, JOB_RUNNING,
 		   node_list, node_inx, task_dist, step_ptr->cpu_freq_max,
 		   step_ptr->cpu_freq_min, step_ptr->cpu_freq_gov,
 		   step_ptr->tres_alloc_str);
 
+	if (step_ptr->cwd)
+		xstrfmtcat(query, ", cwd='%s'", step_ptr->cwd);
+	if (step_ptr->std_err)
+		xstrfmtcat(query, ", std_err='%s'", step_ptr->std_err);
+	if (step_ptr->std_in)
+		xstrfmtcat(query, ", std_in='%s'", step_ptr->std_in);
+	if (step_ptr->std_out)
+		xstrfmtcat(query, ", std_out='%s'", step_ptr->std_out);
 	if (step_ptr->submit_line)
 		xstrfmtcat(query, ", submit_line='%s'", step_ptr->submit_line);
 

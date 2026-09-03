@@ -43,7 +43,6 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <poll.h>
-#include <sched.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -99,7 +98,6 @@ strong_alias(env_unset_environment,	slurm_env_unset_environment);
 typedef struct {
 	char *cmdstr;
 	int *fildes;
-	int mode;
 	bool perform_mount;
 	int rlimit;
 	char **tmp_env;
@@ -463,12 +461,22 @@ int setup_env(env_t *env, bool preserve_env)
 		} else
 			str_bind_type = xstrdup("");
 
-		if (setenvf(&env->env, "SLURM_CPU_BIND", "%s", str_bind)) {
+		/*
+		 * Don't set SLURM_CPU_BIND or SLURM_CPU_BIND_LIST in the
+		 * environment if they are too long. These are informational
+		 * for the user and don't merit an error in the log if they
+		 * can't be set, so avoid calling setenvf().
+		 */
+		if (strlen(str_bind) >= MAX_ENV_STRLEN)
+			debug("Not setting SLURM_CPU_BIND: value too long");
+		else if (setenvf(&env->env, "SLURM_CPU_BIND", "%s", str_bind)) {
 			error("Unable to set SLURM_CPU_BIND");
 			rc = SLURM_ERROR;
 		}
-		if (setenvf(&env->env, "SLURM_CPU_BIND_LIST", "%s",
-			    str_bind_list)) {
+		if (strlen(str_bind_list) >= MAX_ENV_STRLEN)
+			debug("Not setting SLURM_CPU_BIND_LIST: value too long");
+		else if (setenvf(&env->env, "SLURM_CPU_BIND_LIST", "%s",
+				 str_bind_list)) {
 			error("Unable to set SLURM_CPU_BIND_LIST");
 			rc = SLURM_ERROR;
 		}
@@ -490,7 +498,6 @@ int setup_env(env_t *env, bool preserve_env)
 	if (env->mem_bind_type && (env->stepid != SLURM_INTERACTIVE_STEP)) {
 		char *str_verbose, *str_bind_type = NULL, *str_bind_list;
 		char *str_prefer = NULL, *str_bind = NULL;
-		char *str_bind_sort = NULL;
 
 		if (env->batch_flag) {
 			unsetenvp(env->env, "SBATCH_MEM_BIND");
@@ -502,7 +509,6 @@ int setup_env(env_t *env, bool preserve_env)
 			unsetenvp(env->env, "SLURM_MEM_BIND");
 			unsetenvp(env->env, "SLURM_MEM_BIND_LIST");
 			unsetenvp(env->env, "SLURM_MEM_BIND_PREFER");
-			unsetenvp(env->env, "SLURM_MEM_BIND_SORT");
 			unsetenvp(env->env, "SLURM_MEM_BIND_TYPE");
 			unsetenvp(env->env, "SLURM_MEM_BIND_VERBOSE");
 		}
@@ -524,9 +530,6 @@ int setup_env(env_t *env, bool preserve_env)
 		} else if (env->mem_bind_type & MEM_BIND_LOCAL) {
 			str_bind_type = "local";
 		}
-
-		if (env->mem_bind_type & MEM_BIND_SORT)
-			str_bind_sort = "sort";
 
 		if (env->mem_bind)
 			str_bind_list = env->mem_bind;
@@ -561,12 +564,6 @@ int setup_env(env_t *env, bool preserve_env)
 				error("Unable to set SBATCH_MEM_BIND_PREFER");
 				rc = SLURM_ERROR;
 			}
-			if (str_bind_sort &&
-			    setenvf(&env->env, "SBATCH_MEM_BIND_SORT", "%s",
-				    str_bind_sort)) {
-				error("Unable to set SBATCH_MEM_BIND_SORT");
-				rc = SLURM_ERROR;
-			}
 			if (setenvf(&env->env, "SBATCH_MEM_BIND_TYPE", "%s",
 				    str_bind_type)) {
 				error("Unable to set SBATCH_MEM_BIND_TYPE");
@@ -591,12 +588,6 @@ int setup_env(env_t *env, bool preserve_env)
 			    setenvf(&env->env, "SLURM_MEM_BIND_PREFER", "%s",
 				    str_prefer)) {
 				error("Unable to set SLURM_MEM_BIND_PREFER");
-				rc = SLURM_ERROR;
-			}
-			if (str_bind_sort &&
-			    setenvf(&env->env, "SLURM_MEM_BIND_SORT", "%s",
-				    str_bind_sort)) {
-				error("Unable to set SLURM_MEM_BIND_SORT");
 				rc = SLURM_ERROR;
 			}
 			if (setenvf(&env->env, "SLURM_MEM_BIND_TYPE", "%s",
@@ -866,6 +857,15 @@ int setup_env(env_t *env, bool preserve_env)
 		}
 	}
 
+	if (env->tls_cert) {
+		if (setenvf(&env->env, "SLURM_SRUN_TLS_CERT", "%s",
+			    env->tls_cert)) {
+			error("%s: can't set SLURM_SRUN_TLS_CERT env variable",
+			      __func__);
+			rc = SLURM_ERROR;
+		}
+	}
+
 	return rc;
 }
 
@@ -890,7 +890,7 @@ extern char *uint16_array_to_str(int array_len, const uint16_t *array)
 {
 	int i;
 	int previous = 0;
-	char *sep = ",";  /* seperator */
+	char *sep = ",";  /* separator */
 	char *str = xstrdup("");
 
 	if (array == NULL)
@@ -934,7 +934,7 @@ extern char *uint32_compressed_to_str(uint32_t array_len,
 				      const uint32_t *array_reps)
 {
 	int i;
-	char *sep = ","; /* seperator */
+	char *sep = ","; /* separator */
 	char *str = xstrdup("");
 
 	if (!array || !array_reps)
@@ -989,7 +989,7 @@ extern int env_array_for_job(char ***dest,
 	char *dist = NULL;
 	char *key, *value;
 	slurm_step_layout_t *step_layout = NULL;
-	int i, rc = SLURM_SUCCESS;
+	int i, new_cpt, rc = SLURM_SUCCESS;
 	slurm_step_layout_req_t step_layout_req;
 	uint16_t cpus_per_task_array[1];
 	uint32_t cpus_task_reps[1];
@@ -1005,10 +1005,10 @@ extern int env_array_for_job(char ***dest,
 
 	if (het_job_offset < 1) {
 		env_array_overwrite_fmt(dest, "SLURM_JOB_ID", "%u",
-					alloc->job_id);
+					alloc->step_id.job_id);
 	}
-	env_array_overwrite_het_fmt(dest, "SLURM_JOB_ID", het_job_offset,
-				    "%u", alloc->job_id);
+	env_array_overwrite_het_fmt(dest, "SLURM_JOB_ID", het_job_offset, "%u",
+				    alloc->step_id.job_id);
 	env_array_overwrite_het_fmt(dest, "SLURM_JOB_NAME", het_job_offset,
 				    "%s", desc->name);
 	env_array_overwrite_het_fmt(dest, "SLURM_JOB_NUM_NODES", het_job_offset,
@@ -1055,7 +1055,7 @@ extern int env_array_for_job(char ***dest,
 
 	/* OBSOLETE, but needed by MPI, do not remove */
 	env_array_overwrite_het_fmt(dest, "SLURM_JOBID", het_job_offset, "%u",
-				    alloc->job_id);
+				    alloc->step_id.job_id);
 	env_array_overwrite_het_fmt(dest, "SLURM_NNODES", het_job_offset, "%u",
 				    step_layout_req.num_hosts);
 	env_array_overwrite_het_fmt(dest, "SLURM_NODELIST", het_job_offset, "%s",
@@ -1192,15 +1192,33 @@ extern int env_array_for_job(char ***dest,
 					    het_job_offset,
 					    "%d", desc->num_tasks);
 	}
-	if (desc->bitflags & JOB_CPUS_SET) {
+
+	new_cpt = slurm_opt_get_tres_per_task_cpu_cnt(alloc->tres_per_task);
+	if (new_cpt) {
+		env_array_overwrite_het_fmt(dest, "SLURM_CPUS_PER_TASK",
+					    het_job_offset, "%d", new_cpt);
+	} else if (desc->bitflags & JOB_CPUS_SET) {
 		env_array_overwrite_het_fmt(dest, "SLURM_CPUS_PER_TASK",
 					    het_job_offset, "%d",
 					     desc->cpus_per_task);
 	}
+
+	if (alloc->tres_per_task) {
+		env_array_overwrite_het_fmt(dest, "SLURM_TRES_PER_TASK",
+					    het_job_offset, "%s",
+					    alloc->tres_per_task);
+	}
+
 	if (desc->ntasks_per_node && (desc->ntasks_per_node != NO_VAL16)) {
 		env_array_overwrite_het_fmt(dest, "SLURM_NTASKS_PER_NODE",
 					    het_job_offset, "%d",
 					     desc->ntasks_per_node);
+	}
+
+	if (alloc->segment_size) {
+		env_array_overwrite_het_fmt(dest, "SLURM_JOB_SEGMENT_SIZE",
+					    het_job_offset, "%u",
+					    alloc->segment_size);
 	}
 
 	return rc;
@@ -1282,7 +1300,8 @@ env_array_for_batch_job(char ***dest, const batch_job_launch_msg_t *batch,
 	env_array_overwrite_fmt(dest, "SLURM_CLUSTER_NAME", "%s",
 	                        slurm_conf.cluster_name);
 
-	env_array_overwrite_fmt(dest, "SLURM_JOB_ID", "%u", batch->job_id);
+	env_array_overwrite_fmt(dest, "SLURM_JOB_ID", "%u",
+				batch->step_id.job_id);
 	env_array_overwrite_fmt(dest, "SLURM_JOB_NUM_NODES", "%u",
 				step_layout_req.num_hosts);
 	if (batch->array_task_id != NO_VAL) {
@@ -1306,7 +1325,8 @@ env_array_for_batch_job(char ***dest, const batch_job_launch_msg_t *batch,
 		env_array_overwrite_fmt(dest, "HOSTNAME", "%s", node_name);
 
 	/* OBSOLETE, but needed by MPI, do not remove */
-	env_array_overwrite_fmt(dest, "SLURM_JOBID", "%u", batch->job_id);
+	env_array_overwrite_fmt(dest, "SLURM_JOBID", "%u",
+				batch->step_id.job_id);
 	env_array_overwrite_fmt(dest, "SLURM_NNODES", "%u",
 				step_layout_req.num_hosts);
 	env_array_overwrite_fmt(dest, "SLURM_NODELIST", "%s", batch->nodes);
@@ -1324,15 +1344,9 @@ env_array_for_batch_job(char ***dest, const batch_job_launch_msg_t *batch,
 	if (getenvp(*dest, "SLURM_CPUS_PER_TASK"))
 		env_array_overwrite_fmt(dest, "SLURM_CPUS_PER_TASK", "%u",
 					cpus_per_task);
-	if ((tres_per_task = getenvp(*dest, "SLURM_TRES_PER_TASK")) &&
-	    xstrstr(tres_per_task, "cpu=")) {
-		char *new_tres_per_task = xstrdup(tres_per_task);
-		slurm_option_update_tres_per_task(cpus_per_task, "cpu",
-						  &new_tres_per_task);
+	if (batch->tres_per_task)
 		env_array_overwrite_fmt(dest, "SLURM_TRES_PER_TASK", "%s",
-					new_tres_per_task);
-		xfree(new_tres_per_task);
-	}
+					batch->tres_per_task);
 
 	if (step_layout_req.num_tasks) {
 		env_array_overwrite_fmt(dest, "SLURM_NTASKS", "%u",
@@ -1450,14 +1464,36 @@ env_array_for_step(char ***dest,
 		   uint16_t launcher_port,
 		   bool preserve_env)
 {
-	char *tmp, *tpn;
+	char *cluster_name, *tmp, *tpn;
 	uint32_t node_cnt, task_cnt;
 
 	if (!step || !launch)
 		return;
 
+	if (working_cluster_rec && working_cluster_rec->name)
+		cluster_name = working_cluster_rec->name;
+	else
+		cluster_name = slurm_conf.cluster_name;
+	env_array_overwrite_fmt(dest, "SLURM_CLUSTER_NAME", "%s", cluster_name);
+
 	node_cnt = step->step_layout->node_cnt;
-	env_array_overwrite_fmt(dest, "SLURM_STEP_ID", "%u", step->job_step_id);
+	env_array_overwrite_fmt(dest, "SLURM_STEP_ID", "%u",
+				step->step_id.step_id);
+
+	if (launch->cred && launch->cred->arg &&
+	    launch->cred->arg->job_account) {
+		env_array_overwrite_fmt(dest, "SLURM_JOB_ACCOUNT", "%s",
+					launch->cred->arg->job_account);
+	}
+
+	if (launch->cred && launch->cred->arg) {
+		tmp = gid_to_string_or_null(launch->cred->arg->gid);
+		if (tmp) {
+			env_array_overwrite_fmt(dest, "SLURM_JOB_GROUP", "%s",
+						tmp);
+			xfree(tmp);
+		}
+	}
 
 	if (launch->het_job_node_list) {
 		tmp = launch->het_job_node_list;
@@ -1504,7 +1540,8 @@ env_array_for_step(char ***dest,
 	}
 
 	/* OBSOLETE, but needed by some MPI implementations, do not remove */
-	env_array_overwrite_fmt(dest, "SLURM_STEPID", "%u", step->job_step_id);
+	env_array_overwrite_fmt(dest, "SLURM_STEPID", "%u",
+				step->step_id.step_id);
 	if (!preserve_env) {
 		env_array_overwrite_fmt(dest, "SLURM_NNODES", "%u", node_cnt);
 		env_array_overwrite_fmt(dest, "SLURM_NTASKS", "%u", task_cnt);
@@ -1519,7 +1556,7 @@ env_array_for_step(char ***dest,
 }
 
 /*
- * Enviroment variables set elsewhere
+ * Environment variables set elsewhere
  * ----------------------------------
  *
  * Set by slurmstepd:
@@ -1876,23 +1913,6 @@ void env_array_merge_slurm_spank(char ***dest_array, const char **src_array)
 	xfree(value);
 }
 
-/*
- * Strip out trailing carriage returns and newlines
- */
-static void _strip_cr_nl(char *line)
-{
-	int len = strlen(line);
-	char *ptr;
-
-	for (ptr = line+len-1; ptr >= line; ptr--) {
-		if (*ptr=='\r' || *ptr=='\n') {
-			*ptr = '\0';
-		} else {
-			return;
-		}
-	}
-}
-
 /* Return the net count of curly brackets in a string
  * '{' adds one and '}' subtracts one (zero means it is balanced).
  * Special case: return -1 if no open brackets are found */
@@ -1915,11 +1935,6 @@ static int _bracket_cnt(char *value)
  * via the --export-file option in sbatch. The NAME=value entries must
  * be NULL separated to support special characters in the environment
  * definitions.
- *
- * (Note: This is being added to a minor release. For the
- * next major release, it might be a consideration to merge
- * this functionality with that of load_env_cache and update
- * env_cache_builder to use the NULL character.)
  */
 char **env_array_from_file(const char *fname)
 {
@@ -1954,23 +1969,28 @@ char **env_array_from_file(const char *fname)
 	/*
 	 * Read in the user's environment data.
 	 */
-	buf = ptr = xmalloc(buf_size);
+	buf = xmalloc(buf_size);
 	buf_left = buf_size;
-	while ((tmp_size = read(fd, ptr, buf_left))) {
+	while ((tmp_size = read(fd, &buf[file_size], buf_left))) {
 		if (tmp_size < 0) {
 			if (errno == EINTR)
 				continue;
 			error("read(environment_file): %m");
 			break;
 		}
-		buf_left  -= tmp_size;
-		file_size += tmp_size;
-		if (buf_left == 0) {
+
+		if (buf_left <= tmp_size) {
 			buf_size += BUFSIZ;
 			xrealloc(buf, buf_size);
 		}
-		ptr = buf + file_size;
+
+		file_size += tmp_size;
 		buf_left = buf_size - file_size;
+		if (buf_left < 0) {
+			error("%s: We don't have a large enough buffer.",
+			      __func__);
+			break;
+		}
 	}
 	close(fd);
 
@@ -2043,65 +2063,6 @@ rwfail:
 	return rc;
 }
 
-/*
- * Load user environment from a cache file located in
- * <state_save_location>/env_username
- */
-static char **_load_env_cache(const char *username)
-{
-	char fname[PATH_MAX];
-	char *line, name[256], *value;
-	char **env = NULL;
-	FILE *fp;
-	int i;
-
-	i = snprintf(fname, sizeof(fname), "%s/env_cache/%s",
-		     slurm_conf.state_save_location, username);
-	if (i < 0) {
-		error("Environment cache filename overflow");
-		return NULL;
-	}
-	if (!(fp = fopen(fname, "r"))) {
-		error("Could not open user environment cache at %s: %m",
-			fname);
-		return NULL;
-	}
-
-	verbose("Getting cached environment variables at %s", fname);
-	env = env_array_create();
-	line  = xmalloc(ENV_BUFSIZE);
-	value = xmalloc(ENV_BUFSIZE);
-	while (1) {
-		if (!fgets(line, ENV_BUFSIZE, fp))
-			break;
-		_strip_cr_nl(line);
-		if (_env_array_entry_splitter(line, name, sizeof(name),
-					      value, ENV_BUFSIZE) &&
-		    (!_discard_env(name, value))) {
-			if (value[0] == '(') {
-				/* This is a bash function.
-				 * It may span multiple lines */
-				while (_bracket_cnt(value) > 0) {
-					if (!fgets(line, ENV_BUFSIZE, fp))
-						break;
-					_strip_cr_nl(line);
-					if ((strlen(value) + strlen(line)) >
-					    (ENV_BUFSIZE - 2))
-						break;
-					strcat(value, "\n");
-					strcat(value, line);
-				}
-			}
-			env_array_overwrite(&env, name, value);
-		}
-	}
-	xfree(line);
-	xfree(value);
-
-	fclose(fp);
-	return env;
-}
-
 static int _child_fn(void *arg)
 {
 	char **tmp_env = NULL;
@@ -2140,17 +2101,11 @@ static int _child_fn(void *arg)
 	while (fd < child_args->rlimit)
 		close(fd++);
 
-	if (child_args->mode == 1)
-		execle(SUCMD, "su", username, "-c", cmdstr, NULL, tmp_env);
-	else if (child_args->mode == 2)
-		execle(SUCMD, "su", "-", username, "-c", cmdstr, NULL, tmp_env);
-	else {	/* Default system configuration */
 #ifdef LOAD_ENV_NO_LOGIN
-		execle(SUCMD, "su", username, "-c", cmdstr, NULL, tmp_env);
+	execle(SUCMD, "su", username, "-c", cmdstr, NULL, tmp_env);
 #else
-		execle(SUCMD, "su", "-", username, "-c", cmdstr, NULL, tmp_env);
+	execle(SUCMD, "su", "-", username, "-c", cmdstr, NULL, tmp_env);
 #endif
-	}
 	if (devnull >= 0)	/* Avoid Coverity resource leak notification */
 		(void) close(devnull);
 
@@ -2246,32 +2201,28 @@ static bool _ns_disabled()
 
 /*
  * Return an array of strings representing the specified user's default
- * environment variables following a two-prongged approach.
- * 1. Execute (more or less): "/bin/su - <username> -c /usr/bin/env"
+ * environment variables:
+ *    Execute (more or less): "/bin/su - <username> -c /usr/bin/env"
  *    Depending upon the user's login scripts, this may take a very
  *    long time to complete or possibly never return
- * 2. Load the user environment from a cache file. This is used
- *    in the event that option 1 times out.  This only happens if no_cache isn't
- *    set.  If it is set then NULL will be returned if the normal load fails.
  *
- * timeout value is in seconds or zero for default (2 secs)
- * mode is 1 for short ("su <user>"), 2 for long ("su - <user>")
+ * timeout value is in seconds or zero for default (120 secs)
  * On error, returns NULL.
  *
  * NOTE: The calling process must have an effective uid of root for
  * this function to succeed.
  */
-char **env_array_user_default(const char *username, int timeout, int mode,
-			      bool no_cache)
+char **env_array_user_default(const char *username)
 {
 	char *line = NULL, *last = NULL, name[PATH_MAX], *value, *buffer;
 	char **env = NULL;
 	char *starttoken = "XXXXSLURMSTARTPARSINGHEREXXXX";
 	char *stoptoken  = "XXXXSLURMSTOPPARSINGHEREXXXXX";
-	char cmdstr[256], *env_loc = NULL;
+	char *cmdstr = NULL, *env_loc = NULL;
 	char *stepd_path = NULL;
 	int fildes[2], found, fval, len, rc, timeleft;
 	int buf_read, buf_rem, config_timeout;
+	int timeout = DEFAULT_GET_ENV_TIMEOUT;
 	pid_t child;
 	child_args_t child_args = {0};
 	struct timeval begin, now;
@@ -2283,9 +2234,6 @@ char **env_array_user_default(const char *username, int timeout, int mode,
 		error("SlurmdUser must be root to use --get-user-env");
 		return NULL;
 	}
-
-	if (!slurm_conf.get_env_timeout)	/* just read directly from cache */
-		return _load_env_cache(username);
 
 	if (stat(SUCMD, &buf))
 		fatal("Could not locate command: "SUCMD);
@@ -2301,18 +2249,18 @@ char **env_array_user_default(const char *username, int timeout, int mode,
 		env_loc = "/usr/bin/env";
 	else
 		fatal("Could not locate command: env");
-	snprintf(cmdstr, sizeof(cmdstr),
-		 "/bin/echo; /bin/echo; /bin/echo; "
-		 "/bin/echo %s; %s; /bin/echo %s",
-		 starttoken, env_loc, stoptoken);
+
+	/* Construct the final command */
+	cmdstr = xstrdup_printf("/bin/echo; /bin/echo; /bin/echo; "
+				"/bin/echo %s; %s; /bin/echo %s",
+				starttoken, env_loc, stoptoken);
 	xfree(stepd_path);
 
-	if (pipe(fildes) < 0) {
+	if (pipe2(fildes, O_CLOEXEC) < 0) {
 		fatal("pipe: %m");
 		return NULL;
 	}
 
-	child_args.mode = mode;
 	child_args.fildes = fildes;
 	child_args.username = username;
 	child_args.cmdstr = cmdstr;
@@ -2357,6 +2305,7 @@ char **env_array_user_default(const char *username, int timeout, int mode,
 		}
 	}
 #endif
+	xfree(cmdstr);
 	close(fildes[1]);
 	if ((fval = fcntl(fildes[0], F_GETFL, 0)) < 0)
 		error("fcntl(F_GETFL) failed: %m");
@@ -2368,8 +2317,6 @@ char **env_array_user_default(const char *username, int timeout, int mode,
 	ufds.events = POLLIN;
 
 	/* Read all of the output from /bin/su into buffer */
-	if (timeout == 0)
-		timeout = slurm_conf.get_env_timeout;	/* != 0 test above */
 	found = 0;
 	buf_read = 0;
 	buffer = xmalloc(ENV_BUFSIZE);
@@ -2380,7 +2327,7 @@ char **env_array_user_default(const char *username, int timeout, int mode,
 		timeleft -= (now.tv_usec - begin.tv_usec) / 1000;
 		if (timeleft <= 0) {
 			verbose("timeout waiting for "SUCMD" to complete");
-			kill(-child, 9);
+			kill(child, 9);
 			break;
 		}
 		if ((rc = poll(&ufds, 1, timeleft)) <= 0) {
@@ -2423,7 +2370,7 @@ char **env_array_user_default(const char *username, int timeout, int mode,
 	env_array_free(child_args.tmp_env);
 
 	for (config_timeout=0; ; config_timeout++) {
-		kill(-child, SIGKILL);	/* Typically a no-op */
+		kill(child, SIGKILL); /* Typically a no-op */
 		if (config_timeout)
 			sleep(1);
 		if (waitpid(child, &rc, WNOHANG) > 0)
@@ -2442,7 +2389,7 @@ char **env_array_user_default(const char *username, int timeout, int mode,
 	if (!found) {
 		error("Failed to load current user environment variables");
 		xfree(buffer);
-		return no_cache ? _load_env_cache(username) : NULL;
+		return NULL;
 	}
 
 	/* First look for the start token in the output */
@@ -2459,7 +2406,7 @@ char **env_array_user_default(const char *username, int timeout, int mode,
 	if (!found) {
 		error("Failed to get current user environment variables");
 		xfree(buffer);
-		return no_cache ? _load_env_cache(username) : NULL;
+		return NULL;
 	}
 
 	/* Process environment variables until we find the stop token */
@@ -2499,7 +2446,7 @@ char **env_array_user_default(const char *username, int timeout, int mode,
 	if (!found) {
 		error("Failed to get all user environment variables");
 		env_array_free(env);
-		return no_cache ? _load_env_cache(username) : NULL;
+		return NULL;
 	}
 
 	return env;

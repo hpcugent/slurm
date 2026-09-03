@@ -416,7 +416,7 @@ static int _lua_job_info_field(lua_State *L, const job_info_t *job_info,
 	} else if (!xstrcmp(name, "het_job_offset")) {
 		lua_pushinteger(L, job_info->het_job_offset);
 	} else if (!xstrcmp(name, "job_id")) {
-		lua_pushinteger(L, job_info->job_id);
+		lua_pushinteger(L, job_info->step_id.job_id);
 	/* Ignore job_resrcs */
 	} else if (!xstrcmp(name, "job_state")) {
 		lua_pushinteger(L, job_info->job_state);
@@ -512,7 +512,6 @@ static int _lua_job_info_field(lua_State *L, const job_info_t *job_info,
 		lua_pushstring(L, job_info->resv_name);
 	} else if (!xstrcmp(name, "sched_nodes")) {
 		lua_pushstring(L, job_info->sched_nodes);
-	/* Ignore select_jobinfo */
 	} else if (!xstrcmp(name, "selinux_context")) {
 		lua_pushstring(L, job_info->selinux_context);
 	} else if (!xstrcmp(name, "shared")) {
@@ -809,9 +808,11 @@ static int _start_lua_script(const char *func, uint32_t job_id, uint32_t argc,
 	time_t lua_script_last_loaded = (time_t) 0;
 	int rc, i;
 
+	errno = 0;
 	rc = slurm_lua_loadscript(&L, "burst_buffer/lua",
 				  lua_script_path, req_fxns,
-				  &lua_script_last_loaded, _loadscript_extra);
+				  &lua_script_last_loaded, _loadscript_extra,
+				  resp_msg);
 
 	if (rc != SLURM_SUCCESS)
 		return rc;
@@ -1004,13 +1005,12 @@ static void _save_bb_state(void)
 
 static void _recover_bb_state(void)
 {
-	char *state_file = NULL, *data = NULL;
-	int data_allocated, data_read = 0;
+	char *state_file = NULL;
 	uint16_t protocol_version = NO_VAL16;
-	uint32_t data_size = 0, rec_count = 0;
+	uint32_t rec_count = 0;
 	uint32_t id = 0, user_id = 0, group_id = 0;
 	uint64_t size = 0;
-	int i, state_fd;
+	int i;
 	char *account = NULL, *name = NULL;
 	char *partition = NULL, *pool = NULL, *qos = NULL;
 	char *end_ptr = NULL;
@@ -1018,34 +1018,16 @@ static void _recover_bb_state(void)
 	bb_alloc_t *bb_alloc;
 	buf_t *buffer;
 
-	state_fd = bb_open_state_file("burst_buffer_lua_state", &state_file);
-	if (state_fd < 0) {
+	errno = 0;
+	buffer = state_save_open("burst_buffer_lua_state", &state_file);
+	if (!buffer && errno == ENOENT) {
 		info("No burst buffer state file (%s) to recover",
 		     state_file);
 		xfree(state_file);
 		return;
 	}
-	data_allocated = BUF_SIZE;
-	data = xmalloc(data_allocated);
-	while (1) {
-		data_read = read(state_fd, &data[data_size], BUF_SIZE);
-		if (data_read < 0) {
-			if  (errno == EINTR)
-				continue;
-			else {
-				error("Read error on %s: %m", state_file);
-				break;
-			}
-		} else if (data_read == 0)     /* eof */
-			break;
-		data_size      += data_read;
-		data_allocated += data_read;
-		xrealloc(data, data_allocated);
-	}
-	close(state_fd);
 	xfree(state_file);
 
-	buffer = create_buf(data, data_size);
 	safe_unpack16(&protocol_version, buffer);
 	if (protocol_version == NO_VAL16) {
 		if (!ignore_state_errors)
@@ -1550,6 +1532,39 @@ static int _load_pools(uint32_t timeout)
 	return SLURM_SUCCESS;
 }
 
+/*
+ * Set a new job state reason if needed and update the job state reason
+ * description. Use WAIT_NO_REASON to indicate that no update is needed.
+ */
+static void _set_job_state_desc(job_record_t *job_ptr, int new_state,
+				const char *fmt, ...)
+{
+	va_list ap;
+	char *buf;
+
+	if (new_state != WAIT_NO_REASON) {
+		job_ptr->state_reason = new_state;
+	}
+
+	xfree(job_ptr->state_desc);
+	va_start(ap, fmt);
+	buf = vxstrfmt(fmt, ap);
+	va_end(ap);
+
+	if (!job_ptr->priority) {
+		/*
+		 * Make it clear that the job is held, in addition to the
+		 * rest of the reason.
+		 */
+		xstrfmtcat(job_ptr->state_desc, "%s: %s: %s",
+			   plugin_type, job_state_reason_string(WAIT_HELD),
+			   buf);
+	} else {
+		xstrfmtcat(job_ptr->state_desc, "%s: %s", plugin_type, buf);
+	}
+	xfree(buf);
+}
+
 static void _fail_stage(stage_args_t *stage_args, const char *op,
 			int rc, char *resp_msg)
 {
@@ -1571,11 +1586,9 @@ static void _fail_stage(stage_args_t *stage_args, const char *op,
 	}
 
 	bb_update_system_comment(job_ptr, (char *) op, resp_msg, 0);
-	xfree(job_ptr->state_desc);
-	job_ptr->state_reason = FAIL_BURST_BUFFER_OP;
-	xstrfmtcat(job_ptr->state_desc, "%s: %s: %s",
-		   plugin_type, op, resp_msg);
 	job_ptr->priority = 0; /* Hold job */
+	_set_job_state_desc(job_ptr, FAIL_BURST_BUFFER_OP,
+			    "%s failed: %s", op, resp_msg);
 	if (bb_state.bb_config.flags & BB_FLAG_TEARDOWN_FAILURE) {
 		bb_job = bb_job_find(&bb_state, job_ptr->job_id);
 		if (bb_job)
@@ -1745,9 +1758,7 @@ static void _pre_queue_stage_out(job_record_t *job_ptr, bb_job_t *bb_job)
 {
 	bb_set_job_bb_state(job_ptr, bb_job, BB_STATE_POST_RUN);
 	job_state_set_flag(job_ptr, JOB_STAGE_OUT);
-	xfree(job_ptr->state_desc);
-	xstrfmtcat(job_ptr->state_desc, "%s: Stage-out in progress",
-		   plugin_type);
+	_set_job_state_desc(job_ptr, WAIT_NO_REASON, "Stage-out in progress");
 	_queue_stage_out(job_ptr, bb_job);
 }
 
@@ -2093,12 +2104,9 @@ static bb_job_t *_get_bb_job(job_record_t *job_ptr)
 	xfree(bb_specs);
 
 	if (!have_bb) {
-		xfree(job_ptr->state_desc);
-		job_ptr->state_reason = FAIL_BURST_BUFFER_OP;
-		xstrfmtcat(job_ptr->state_desc,
-			   "%s: Invalid burst buffer spec (%s)",
-			   plugin_type, job_ptr->burst_buffer);
 		job_ptr->priority = 0;
+		_set_job_state_desc(job_ptr, FAIL_BURST_BUFFER_OP,
+				    "Invalid burst buffer spec (%s)");
 		info("Invalid burst buffer spec for %pJ (%s)",
 		     job_ptr, job_ptr->burst_buffer);
 		bb_job_del(&bb_state, job_ptr->job_id);
@@ -2187,10 +2195,6 @@ static void _test_config(void)
 	}
 }
 
-/*
- * init() is called when the plugin is loaded, before any other functions
- * are called.  Put global initialization here.
- */
 extern int init(void)
 {
 	int rc;
@@ -2201,11 +2205,7 @@ extern int init(void)
                 return rc;
 	lua_script_path = get_extra_conf_path("burst_buffer.lua");
 
-	if ((rc = serializer_g_init(MIME_TYPE_JSON_PLUGIN, NULL))) {
-		error("%s: unable to load JSON serializer: %s",
-		      __func__, slurm_strerror(rc));
-		return rc;
-	}
+	serializer_required(MIME_TYPE_JSON);
 
 	/*
 	 * slurmscriptd calls bb_g_init() and then bb_g_run_script(). We only
@@ -2220,7 +2220,8 @@ extern int init(void)
 	/* Check that the script can load successfully */
 	rc = slurm_lua_loadscript(&L, "burst_buffer/lua",
 				  lua_script_path, req_fxns,
-				  &lua_script_last_loaded, _loadscript_extra);
+				  &lua_script_last_loaded, _loadscript_extra,
+				  NULL);
 	if (rc != SLURM_SUCCESS)
 		return rc;
 	else
@@ -2240,10 +2241,7 @@ extern int init(void)
 	return SLURM_SUCCESS;
 }
 
-/*
- * fini() is called when the plugin is unloaded. Free all memory.
- */
-extern int fini(void)
+extern void fini(void)
 {
 	int thread_cnt, last_thread_cnt = 0;
 
@@ -2254,7 +2252,7 @@ extern int fini(void)
 	slurm_mutex_lock(&bb_state.term_mutex);
 	if (bb_state.term_flag) {
 		slurm_mutex_unlock(&bb_state.term_mutex);
-		return SLURM_SUCCESS;
+		return;
 	}
 	bb_state.term_flag = true;
 	slurm_cond_broadcast(&bb_state.term_cond);
@@ -2284,8 +2282,6 @@ extern int fini(void)
 
 	slurm_lua_fini();
 	xfree(lua_script_path);
-
-	return SLURM_SUCCESS;
 }
 
 static void _free_orphan_alloc_rec(void *x)
@@ -3068,11 +3064,10 @@ static void *_start_teardown(void *x)
 				job_ptr =
 					find_job_record(teardown_args->job_id);
 				if (job_ptr) {
-					job_ptr->state_reason =
-						FAIL_BURST_BUFFER_OP;
-					xfree(job_ptr->state_desc);
-					xstrfmtcat(job_ptr->state_desc, "%s: teardown: %s",
-						   plugin_type, resp_msg);
+					_set_job_state_desc(
+						job_ptr, FAIL_BURST_BUFFER_OP,
+						"teardown failed: %s",
+						resp_msg);
 					bb_update_system_comment(job_ptr,
 								 "teardown",
 								 resp_msg, 0);
@@ -3615,7 +3610,7 @@ fini:	xfree(data_buf);
 }
 
 /* Kill job from CONFIGURING state */
-static void _kill_job(job_record_t *job_ptr, bool hold_job)
+static void _kill_job(job_record_t *job_ptr, bool hold_job, char *resp_msg)
 {
 	last_job_update = time(NULL);
 	job_ptr->end_time = last_job_update;
@@ -3623,9 +3618,9 @@ static void _kill_job(job_record_t *job_ptr, bool hold_job)
 		job_ptr->priority = 0;
 	build_cg_bitmap(job_ptr);
 	job_ptr->exit_code = 1;
-	job_ptr->state_reason = FAIL_BURST_BUFFER_OP;
-	xfree(job_ptr->state_desc);
-	job_ptr->state_desc = xstrdup("Burst buffer pre_run error");
+	_set_job_state_desc(job_ptr, FAIL_BURST_BUFFER_OP,
+			    "%s failed: %s", req_fxns[SLURM_BB_PRE_RUN],
+			    resp_msg);
 
 	job_state_set(job_ptr, JOB_REQUEUE);
 	job_completion_logger(job_ptr, true);
@@ -3738,7 +3733,7 @@ static void *_start_pre_run(void *x)
 	slurm_mutex_unlock(&bb_state.bb_mutex);
 	if (run_kill_job) {
 		/* bb_mutex must be unlocked before calling this */
-		_kill_job(job_ptr, hold_job);
+		_kill_job(job_ptr, hold_job, resp_msg);
 	}
 	unlock_slurmctld(job_write_lock);
 
@@ -3791,10 +3786,8 @@ extern int bb_p_job_begin(job_record_t *job_ptr)
 	bb_job = _get_bb_job(job_ptr);
 	if (!bb_job) {
 		error("no job record buffer for %pJ", job_ptr);
-		xfree(job_ptr->state_desc);
-		job_ptr->state_desc =
-			xstrdup("Could not find burst buffer record");
-		job_ptr->state_reason = FAIL_BURST_BUFFER_OP;
+		_set_job_state_desc(job_ptr, FAIL_BURST_BUFFER_OP,
+				    "Could not find burst buffer record");
 		_queue_teardown(job_ptr->job_id, job_ptr->user_id, true,
 				job_ptr->group_id);
 		slurm_mutex_unlock(&bb_state.bb_mutex);

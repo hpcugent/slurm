@@ -90,6 +90,14 @@ typedef struct {
 	slurmdb_used_limits_t *used_limits_user;
 } acct_policy_accrue_t;
 
+typedef struct {
+	uint32_t job_cnt;
+	job_record_t *job_ptr;
+	list_t *part_qos_list;
+	int type;
+	uint64_t *used_tres_run_secs;
+} foreach_part_qos_limit_usage_t;
+
 static void _apply_limit_factor(uint64_t *limit, double limit_factor)
 {
 	int64_t new_val;
@@ -866,6 +874,32 @@ static int _find_qos_part(void *x, void *key)
 	return 0;
 }
 
+static int _foreach_part_qos_limit_usage(void *x, void *arg)
+{
+	part_record_t *part_ptr = x;
+	foreach_part_qos_limit_usage_t *part_qos_limit_usage = arg;
+
+	if (!part_ptr->qos_ptr)
+		return 0;
+	if (!part_qos_limit_usage->part_qos_list)
+		part_qos_limit_usage->part_qos_list = list_create(NULL);
+	/*
+	 * Don't adjust usage to this partition's qos if
+	 * it's the same as the qos of another partition
+	 * that we already handled.
+	 */
+	if (list_find_first(part_qos_limit_usage->part_qos_list, _find_qos_part,
+			    part_ptr->qos_ptr))
+		return 0;
+	list_push(part_qos_limit_usage->part_qos_list, part_ptr->qos_ptr);
+	_qos_adjust_limit_usage(part_qos_limit_usage->type,
+				part_qos_limit_usage->job_ptr,
+				part_ptr->qos_ptr,
+				part_qos_limit_usage->used_tres_run_secs,
+				part_qos_limit_usage->job_cnt);
+	return 0;
+}
+
 static void _adjust_limit_usage(int type, job_record_t *job_ptr,
 				bool assoc_locked)
 {
@@ -947,10 +981,13 @@ static void _adjust_limit_usage(int type, job_record_t *job_ptr,
 	    job_ptr->part_ptr_list &&
 	    (IS_JOB_PENDING(job_ptr) || !job_ptr->tres_alloc_str)) {
 		bool job_first = false;
-		list_itr_t *part_itr;
-		part_record_t *part_ptr;
-		list_t *part_qos_list = NULL;
-
+		foreach_part_qos_limit_usage_t part_qos_limit_usage = {
+			.job_cnt = job_cnt,
+			.job_ptr = job_ptr,
+			.part_qos_list = NULL,
+			.type = type,
+			.used_tres_run_secs = used_tres_run_secs,
+		};
 		if (job_ptr->qos_ptr &&
 		    (((slurmdb_qos_rec_t *)job_ptr->qos_ptr)->flags
 		     & QOS_FLAG_OVER_PART_QOS))
@@ -959,30 +996,14 @@ static void _adjust_limit_usage(int type, job_record_t *job_ptr,
 		if (job_first) {
 			_qos_adjust_limit_usage(type, job_ptr, job_ptr->qos_ptr,
 						used_tres_run_secs, job_cnt);
-			part_qos_list = list_create(NULL);
-			list_push(part_qos_list, job_ptr->qos_ptr);
+			part_qos_limit_usage.part_qos_list = list_create(NULL);
+			list_push(part_qos_limit_usage.part_qos_list,
+				  job_ptr->qos_ptr);
 		}
 
-		part_itr = list_iterator_create(job_ptr->part_ptr_list);
-		while ((part_ptr = list_next(part_itr))) {
-			if (!part_ptr->qos_ptr)
-				continue;
-			if (!part_qos_list)
-				part_qos_list = list_create(NULL);
-			/*
-			 * Don't adjust usage to this partition's qos if
-			 * it's the same as the qos of another partition
-			 * that we already handled.
-			 */
-			if (list_find_first(part_qos_list, _find_qos_part,
-					    part_ptr->qos_ptr))
-				continue;
-			list_push(part_qos_list, part_ptr->qos_ptr);
-			_qos_adjust_limit_usage(type, job_ptr,
-						part_ptr->qos_ptr,
-						used_tres_run_secs, job_cnt);
-		}
-		list_iterator_destroy(part_itr);
+		(void) list_for_each(job_ptr->part_ptr_list,
+				     _foreach_part_qos_limit_usage,
+				     &part_qos_limit_usage);
 
 		/*
 		 * Don't adjust usage to this job's qos if
@@ -990,13 +1011,14 @@ static void _adjust_limit_usage(int type, job_record_t *job_ptr,
 		 * that we already handled.
 		 */
 		if (!job_first && job_ptr->qos_ptr &&
-		    (!part_qos_list ||
-		     !list_find_first(part_qos_list, _find_qos_part,
+		    (!part_qos_limit_usage.part_qos_list ||
+		     !list_find_first(part_qos_limit_usage.part_qos_list,
+				      _find_qos_part,
 				      job_ptr->qos_ptr)))
 			_qos_adjust_limit_usage(type, job_ptr, job_ptr->qos_ptr,
 						used_tres_run_secs, job_cnt);
 
-		FREE_NULL_LIST(part_qos_list);
+		FREE_NULL_LIST(part_qos_limit_usage.part_qos_list);
 	} else {
 		slurmdb_qos_rec_t *qos_ptr_1, *qos_ptr_2;
 
@@ -1007,39 +1029,27 @@ static void _adjust_limit_usage(int type, job_record_t *job_ptr,
 		 */
 		if ((type == ACCT_POLICY_JOB_BEGIN) &&
 		    job_ptr->part_ptr_list) {
-			list_itr_t *part_itr;
-			part_record_t *part_ptr;
-			list_t *part_qos_list = list_create(NULL);
+			foreach_part_qos_limit_usage_t part_qos_limit_usage = {
+				.job_cnt = job_cnt,
+				.job_ptr = job_ptr,
+				.part_qos_list = list_create(NULL),
+				.type = ACCT_POLICY_REM_SUBMIT,
+				.used_tres_run_secs = used_tres_run_secs,
+			};
 
 			if (job_ptr->qos_ptr)
-				list_push(part_qos_list, job_ptr->qos_ptr);
+				list_push(part_qos_limit_usage.part_qos_list,
+					  job_ptr->qos_ptr);
 			if (job_ptr->part_ptr && job_ptr->part_ptr->qos_ptr &&
 			    job_ptr->qos_ptr != job_ptr->part_ptr->qos_ptr)
-				list_push(part_qos_list,
+				list_push(part_qos_limit_usage.part_qos_list,
 					  job_ptr->part_ptr->qos_ptr);
 
-			part_itr = list_iterator_create(job_ptr->part_ptr_list);
-			while ((part_ptr = list_next(part_itr))) {
-				if (!part_ptr->qos_ptr)
-					continue;
+			(void) list_for_each(job_ptr->part_ptr_list,
+					     _foreach_part_qos_limit_usage,
+					     &part_qos_limit_usage);
 
-				/*
-				 * Don't adjust usage to this partition's qos if
-				 * it's the same as the qos of another partition
-				 * that we already handled.
-				 */
-				if (list_find_first(part_qos_list,
-						    _find_qos_part,
-						    part_ptr->qos_ptr))
-					continue;
-				_qos_adjust_limit_usage(ACCT_POLICY_REM_SUBMIT,
-							job_ptr,
-							part_ptr->qos_ptr,
-							used_tres_run_secs,
-							job_cnt);
-			}
-			list_iterator_destroy(part_itr);
-			FREE_NULL_LIST(part_qos_list);
+			FREE_NULL_LIST(part_qos_limit_usage.part_qos_list);
 		}
 
 		acct_policy_set_qos_order(job_ptr, &qos_ptr_1, &qos_ptr_2);
@@ -1057,13 +1067,17 @@ static void _adjust_limit_usage(int type, job_record_t *job_ptr,
 			assoc_ptr->usage->used_submit_jobs += job_cnt;
 			break;
 		case ACCT_POLICY_REM_SUBMIT:
-			if (assoc_ptr->usage->used_submit_jobs)
+			if (assoc_ptr->usage->used_submit_jobs >= job_cnt)
 				assoc_ptr->usage->used_submit_jobs -= job_cnt;
-			else
+			else {
 				debug2("acct_policy_remove_job_submit: "
 				       "used_submit_jobs underflow for "
-				       "account %s",
-				       assoc_ptr->acct);
+				       "account %s (%u < %u)",
+				       assoc_ptr->acct,
+				       assoc_ptr->usage->used_submit_jobs,
+				       job_cnt);
+				assoc_ptr->usage->used_submit_jobs = 0;
+			}
 			break;
 		case ACCT_POLICY_JOB_BEGIN:
 			assoc_ptr->usage->used_jobs++;
@@ -1096,6 +1110,13 @@ static void _adjust_limit_usage(int type, job_record_t *job_ptr,
 			}
 			break;
 		case ACCT_POLICY_JOB_FINI:
+			/*
+			 * If tres_alloc_cnt doesn't exist means
+			 * ACCT_POLICY_JOB_BEGIN was never called so no need to
+			 * clean up that which was never set up.
+			 */
+			if (!job_ptr->tres_alloc_cnt)
+				break;
 			if (assoc_ptr->usage->used_jobs)
 				assoc_ptr->usage->used_jobs--;
 			else
@@ -1143,11 +1164,11 @@ static void _adjust_limit_usage(int type, job_record_t *job_ptr,
 	}
 
 	/*
-	 * When we are removing submit we need to set the pointer back if it was
-	 * changed.
+	 * Now that we are done with accrue set things back to the way
+	 * it was qos wise. Accrue limits are always based on the
+	 * highest priority QOS.
 	 */
-	if ((type == ACCT_POLICY_REM_SUBMIT) &&
-	    (orig_qos_ptr != job_ptr->qos_ptr)) {
+	if (orig_qos_ptr && (orig_qos_ptr != job_ptr->qos_ptr)) {
 		job_ptr->qos_ptr = orig_qos_ptr;
 		job_ptr->qos_id = orig_qos_ptr->id;
 	}
@@ -1326,7 +1347,7 @@ static bool _validate_tres_limits_for_qos(
 	uint16_t *admin_set_limit_tres_array,
 	bool strict_checking, bool max_limit)
 {
-	uint64_t max_tres_limit, out_max_tres_limit;
+	uint64_t max_tres_limit;
 	int i;
 	uint64_t job_tres;
 
@@ -1335,34 +1356,27 @@ static bool _validate_tres_limits_for_qos(
 
 	for (i = 0; i < g_tres_count; i++) {
 		(*tres_pos) = i;
-		if (grp_tres_array) {
-			max_tres_limit = MIN(grp_tres_array[i],
-					     max_tres_array[i]);
-			out_max_tres_limit = MIN(out_grp_tres_array[i],
-						 out_max_tres_array[i]);
-		} else {
-			max_tres_limit = max_tres_array[i];
-			out_max_tres_limit = out_max_tres_array[i];
-		}
+		max_tres_limit = grp_tres_array ? MIN(grp_tres_array[i],
+						      max_tres_array[i]) :
+						  max_tres_array[i];
 
 		/* we don't need to look at this limit */
-		if ((admin_set_limit_tres_array[i] == ADMIN_SET_LIMIT)
-		    || (out_max_tres_limit != INFINITE64)
-		    || (max_tres_limit == INFINITE64)
-		    || (job_tres_array[i] && (job_tres_array[i] == NO_VAL64)))
+		if ((admin_set_limit_tres_array[i] == ADMIN_SET_LIMIT) ||
+		    ((out_max_tres_array[i] != INFINITE64) &&
+		     ((!out_grp_tres_array) ||
+		      (out_grp_tres_array[i] != INFINITE64))) ||
+		    (max_tres_limit == INFINITE64) ||
+		    (job_tres_array[i] == NO_VAL64))
 			continue;
-
-		out_max_tres_array[i] = max_tres_array[i];
 
 		job_tres = job_tres_array[i];
 
 		if (divisor)
 			job_tres /= divisor;
 
-		if (out_grp_tres_array && grp_tres_array) {
-			if (out_grp_tres_array[i] == INFINITE64)
-				out_grp_tres_array[i] = grp_tres_array[i];
-
+		if (out_grp_tres_array && grp_tres_array &&
+		    (out_grp_tres_array[i] == INFINITE64)) {
+			out_grp_tres_array[i] = grp_tres_array[i];
 			if (max_limit) {
 				if (job_tres > grp_tres_array[i])
 					return false;
@@ -1370,11 +1384,14 @@ static bool _validate_tres_limits_for_qos(
 				return false;
 		}
 
-		if (max_limit) {
-			if (job_tres > max_tres_array[i])
+		if (out_max_tres_array[i] == INFINITE64) {
+			out_max_tres_array[i] = max_tres_array[i];
+			if (max_limit) {
+				if (job_tres > max_tres_array[i])
+					return false;
+			} else if (job_tres < max_tres_array[i])
 				return false;
-		} else if (job_tres < max_tres_array[i])
-			return false;
+		}
 	}
 
 	return true;
@@ -3666,7 +3683,7 @@ extern bool acct_policy_validate(job_desc_msg_t *job_desc,
  * upon that component's job and partition QOS.
  *
  * NOTE: That a hetjob passes this test does not mean that it will be able
- * to run. For example, this test assumues resource allocation at the CPU level.
+ * to run. For example, this test assumes resource allocation at the CPU level.
  * If each task is allocated one core, with 2 CPUs, then the CPU limit test
  * would not be accurate.
  *
@@ -4509,7 +4526,7 @@ extern uint32_t acct_policy_get_max_nodes(job_record_t *job_ptr,
  *	the association/qos limits prevent the job from running (lowered
  *	limits since job submission), then reset its reason field.
  */
-extern int acct_policy_update_pending_job(job_record_t *job_ptr)
+extern int acct_policy_update_pending_job(job_record_t *job_ptr, bool update_db)
 {
 	job_desc_msg_t job_desc;
 	acct_policy_limit_set_t acct_policy_limit_set;
@@ -4584,7 +4601,8 @@ extern int acct_policy_update_pending_job(job_record_t *job_ptr)
 		last_job_update = time(NULL);
 		debug("limits changed for %pJ: updating accounting", job_ptr);
 		/* Update job record in accounting to reflect changes */
-		jobacct_storage_g_job_start(acct_db_conn, job_ptr);
+		if (update_db)
+			jobacct_storage_g_job_start(acct_db_conn, job_ptr);
 	}
 
 	return rc;

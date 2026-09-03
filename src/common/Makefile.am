@@ -26,19 +26,22 @@ libcommon_la_SOURCES =				\
 	daemonize.h				\
 	data.c					\
 	data.h					\
+	dynamic_plugin_data.c			\
+	dynamic_plugin_data.h			\
 	eio.c					\
 	eio.h					\
 	env.c					\
 	env.h					\
 	extra_constraints.c			\
 	extra_constraints.h			\
+	events.c				\
+	events.h				\
 	fd.c					\
 	fd.h					\
 	fetch_config.c				\
 	fetch_config.h				\
 	forward.c				\
 	forward.h				\
-	front_end.h				\
 	global_defaults.c			\
 	group_cache.c				\
 	group_cache.h				\
@@ -48,6 +51,12 @@ libcommon_la_SOURCES =				\
 	hostlist.h				\
 	http.h					\
 	http.c					\
+	http_con.h				\
+	http_con.c				\
+	http_router.h				\
+	http_router.c				\
+	http_switch.h				\
+	http_switch.c				\
 	identity.h				\
 	identity.c				\
 	id_util.h				\
@@ -159,6 +168,8 @@ libcommon_la_SOURCES =				\
 	state_save.h				\
 	stepd_api.c				\
 	stepd_api.h				\
+	stepd_proxy.c				\
+	stepd_proxy.h				\
 	strlcpy.c				\
 	strlcpy.h				\
 	strnatcmp.c				\
@@ -190,8 +201,12 @@ libcommon_la_SOURCES =				\
 	xhash.h					\
 	xmalloc.c				\
 	xmalloc.h				\
+	xrandom.c				\
+	xrandom.h				\
 	xregex.c				\
 	xregex.h				\
+	xsched.c				\
+	xsched.h				\
 	xsystemd.c				\
 	xsystemd.h				\
 	xsignal.c				\

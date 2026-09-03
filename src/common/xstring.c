@@ -491,7 +491,7 @@ char *xstrdup(const char *str)
 /*
  * Give me a copy of the string as if it were printf.
  *   fmt (IN)		format of string and args if any
- *   RETURN		copy of formated string
+ *   RETURN		copy of formatted string
  */
 char *xstrdup_printf(const char *fmt, ...)
 {
@@ -671,13 +671,13 @@ extern bool xstrtolower(char *str)
 /* safe strchr */
 char *xstrchr(const char *s1, int c)
 {
-	return s1 ? strchr(s1, c) : NULL;
+	return s1 ? (char *) strchr(s1, c) : NULL;
 }
 
 /* safe strrchr */
 char *xstrrchr(const char *s1, int c)
 {
-	return s1 ? strrchr(s1, c) : NULL;
+	return s1 ? (char *) strrchr(s1, c) : NULL;
 }
 
 /* safe strcmp */
@@ -739,7 +739,7 @@ char *xstrstr(const char *haystack, const char *needle)
 	if (!haystack || !needle)
 		return NULL;
 
-	return strstr(haystack, needle);
+	return (char *) strstr(haystack, needle);
 }
 
 char *xstrcasestr(const char *haystack, const char *needle)
@@ -757,7 +757,7 @@ char *xstrcasestr(const char *haystack, const char *needle)
 		for (need_inx=0; need_inx<need_size; need_inx++) {
 			if (tolower((int) hay_ptr[need_inx]) !=
 			    tolower((int) needle [need_inx]))
-				break;		/* mis-match */
+				break;		/* mismatch */
 		}
 
 		if (need_inx == need_size)	/* it matched */
@@ -775,7 +775,7 @@ char *xstrcasestr(const char *haystack, const char *needle)
  * functions can do va_start() and invoke this function.
  *
  *   fmt (IN)		format of string and args if any
- *   RETURN		copy of formated string
+ *   RETURN		copy of formatted string
  */
 size_t _xstrdup_vprintf(char **str, const char *fmt, va_list ap)
 {
@@ -896,11 +896,12 @@ extern char *xbase64_from_base64url(const char *in)
 {
 	char *out;
 	int i;
+	size_t length = strlen(in);
 
 	/* extra padding in case the padding was stripped off */
-	out = xmalloc(strlen(in) + 3);
+	out = xmalloc(length + 3);
 
-	for (i = 0; i < strlen(in); i++) {
+	for (i = 0; i < length; i++) {
 		switch (in[i]) {
 		case '-':
 			out[i] = '+';

@@ -119,6 +119,11 @@ extern int as_mysql_acct_no_assocs(mysql_conn_t *mysql_conn,
 
 	xassert(ret_list);
 
+	if (assoc_cond &&
+	    (as_mysql_validate_cluster_list(assoc_cond->cluster_list) !=
+	     SLURM_SUCCESS))
+		return SLURM_ERROR;
+
 	query = xstrdup_printf("select name from %s where deleted=0",
 			       acct_table);
 	if (assoc_cond &&
@@ -220,6 +225,11 @@ extern int as_mysql_acct_no_users(mysql_conn_t *mysql_conn,
 	bool locked = false;
 
 	xassert(ret_list);
+
+	if (assoc_cond &&
+	    (as_mysql_validate_cluster_list(assoc_cond->cluster_list) !=
+	     SLURM_SUCCESS))
+		return SLURM_ERROR;
 
 	_setup_assoc_cond_limits(assoc_cond, &extra, 0);
 
@@ -326,6 +336,11 @@ extern int as_mysql_user_no_assocs_or_no_uid(
 
 	xassert(ret_list);
 
+	if (assoc_cond &&
+	    (as_mysql_validate_cluster_list(assoc_cond->cluster_list) !=
+	     SLURM_SUCCESS))
+		return SLURM_ERROR;
+
 	query = xstrdup_printf("select name from %s where deleted=0",
 			       user_table);
 	if (assoc_cond &&
@@ -367,7 +382,7 @@ extern int as_mysql_user_no_assocs_or_no_uid(
 		slurmdb_assoc_rec_t *assoc = NULL;
 		uid_t pw_uid;
 
-		if (uid_from_string (row[0], &pw_uid) < 0) {
+		if (uid_from_string(row[0], &pw_uid) != SLURM_SUCCESS) {
 			assoc =	xmalloc(sizeof(slurmdb_assoc_rec_t));
 			list_append(ret_list, assoc);
 

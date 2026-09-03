@@ -801,6 +801,11 @@ extern list_t *as_mysql_get_res(mysql_conn_t *mysql_conn, uid_t uid,
 	if (check_connection(mysql_conn) != SLURM_SUCCESS)
 		return NULL;
 
+	if (res_cond &&
+	    (as_mysql_validate_cluster_list(res_cond->cluster_list) !=
+	     SLURM_SUCCESS))
+		return NULL;
+
 	_setup_res_cond(res_cond, &extra);
 
 	xfree(tmp);
@@ -898,15 +903,18 @@ extern list_t *as_mysql_remove_res(mysql_conn_t *mysql_conn, uint32_t uid,
 {
 	list_t *ret_list = NULL;
 	char *name_char = NULL, *clus_char = NULL;
-	char *user_name = NULL;
 	char *query = NULL, *extra = NULL, *clus_extra = NULL;
-	time_t now = time(NULL);
 	MYSQL_RES *result = NULL;
 	MYSQL_ROW row;
 	int query_clusters;
 	bool res_added = 0;
 	bool have_clusters = 0;
 	int last_res = -1;
+	remove_common_args_t args = {
+		.mysql_conn = mysql_conn,
+		.table = clus_res_table,
+		.type = DBD_REMOVE_CLUS_RES,
+	};
 
 	if (!res_cond) {
 		error("we need something to remove");
@@ -923,6 +931,10 @@ extern list_t *as_mysql_remove_res(mysql_conn_t *mysql_conn, uint32_t uid,
 	}
 	/* force to only do non-deleted server resources */
 	res_cond->with_deleted = 0;
+
+	if (as_mysql_validate_cluster_list(res_cond->cluster_list) !=
+	    SLURM_SUCCESS)
+		return NULL;
 
 	_setup_res_cond(res_cond, &extra);
 	query_clusters = _setup_clus_res_cond(res_cond, &clus_extra);
@@ -1023,23 +1035,23 @@ extern list_t *as_mysql_remove_res(mysql_conn_t *mysql_conn, uint32_t uid,
 
 	xfree(query);
 
-	user_name = uid_to_string((uid_t) uid);
+	args.name_char = clus_char;
+	args.user_name = uid_to_string((uid_t) uid);
+	args.now = time(NULL);
+
 	if (query_clusters) {
-		remove_common(mysql_conn, DBD_REMOVE_CLUS_RES,
-			      now, user_name, clus_res_table,
-			      clus_char, NULL, NULL, NULL, NULL, NULL);
+		remove_common(&args);
 	} else {
-		remove_common(mysql_conn, DBD_REMOVE_CLUS_RES,
-			      now, user_name, clus_res_table,
-			      clus_char, NULL, NULL, NULL, NULL, NULL);
-		remove_common(mysql_conn, DBD_REMOVE_RES,
-			      now, user_name, res_table,
-			      name_char, NULL, NULL, NULL, NULL, NULL);
+		remove_common(&args);
+
+		args.name_char = name_char;
+		args.table = res_table;
+		remove_common(&args);
 	}
 
 	xfree(clus_char);
 	xfree(name_char);
-	xfree(user_name);
+	xfree(args.user_name);
 
 	return ret_list;
 }
@@ -1101,6 +1113,10 @@ extern list_t *as_mysql_modify_res(mysql_conn_t *mysql_conn, uint32_t uid,
 	if (check_connection(mysql_conn) != SLURM_SUCCESS) {
 		return NULL;
 	}
+
+	if (as_mysql_validate_cluster_list(res_cond->cluster_list) !=
+	    SLURM_SUCCESS)
+		return NULL;
 
 	_setup_res_limits(res, NULL, &tmp, &vals, 0, &send_update);
 

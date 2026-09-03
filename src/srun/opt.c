@@ -85,6 +85,7 @@ static void _usage(void);
 static void _autocomplete(const char *query);
 
 /*---- global variables, defined in opt.h ----*/
+int colon_cnt = 0;
 int	error_exit = 1;
 int	immediate_exit = 1;
 srun_opt_t sropt;
@@ -299,6 +300,7 @@ static slurm_opt_t *_opt_copy(void)
 	opt_dup->ifname = xstrdup(opt.ifname);
 	opt_dup->job_name = xstrdup(opt.job_name);
 	opt.licenses = NULL;		/* Moved by memcpy */
+	opt.resources = NULL; /* Moved by memcpy */
 	opt.mail_user = NULL;		/* Moved by memcpy */
 	opt_dup->mcs_label = xstrdup(opt.mcs_label);
 	opt.mem_bind = NULL;		/* Moved by memcpy */
@@ -385,7 +387,9 @@ extern int initialize_and_process_args(int argc, char **argv, int *argc_off)
 
 		if (opt_found || (i > 0)) {
 			xstrfmtcat(sropt.het_group, "%d", i);
-			sropt.het_grp_bits = bit_alloc(MAX_HET_JOB_COMPONENTS);
+			if (!sropt.het_grp_bits)
+				sropt.het_grp_bits =
+					bit_alloc(MAX_HET_JOB_COMPONENTS);
 			bit_set(sropt.het_grp_bits, i);
 		}
 
@@ -454,7 +458,7 @@ extern int initialize_and_process_args(int argc, char **argv, int *argc_off)
 		if (opt.verbose)
 			slurm_print_set_options(&opt);
 
-		if (spank_init_post_opt() < 0) {
+		if (spank_init_post_opt()) {
 			error("Plugin stack post-option processing failed.");
 			exit(error_exit);
 		}
@@ -546,6 +550,7 @@ env_vars_t env_vars[] = {
   { "SLURM_CLUSTERS", 'M' },
   { "SLURM_CLUSTER_CONSTRAINT", LONG_OPT_CLUSTER_CONSTRAINT },
   { "SLURM_COMPRESS", LONG_OPT_COMPRESS },
+  { "SLURM_CONSOLIDATE_SEGMENTS", LONG_OPT_CONSOLIDATE_SEGMENTS },
   { "SLURM_CONSTRAINT", 'C' },
   { "SLURM_CORE_SPEC", 'S' },
   { "SLURM_CPUS_PER_TASK", 'c' },
@@ -609,6 +614,7 @@ env_vars_t env_vars[] = {
   { "SLURM_SEND_LIBS", LONG_OPT_SEND_LIBS },
   { "SLURM_SIGNAL", LONG_OPT_SIGNAL },
   { "SLURM_SPREAD_JOB", LONG_OPT_SPREAD_JOB },
+  { "SLURM_SPREAD_SEGMENTS", LONG_OPT_SPREAD_SEGMENTS },
   { "SLURM_SRUN_MULTI", LONG_OPT_MULTI },
   { "SLURM_STDERRMODE", 'e' }, /* Left for backward compatibility */
   { "SLURM_STDINMODE", 'i' }, /* Left for backward compatibility */
@@ -634,6 +640,7 @@ env_vars_t env_vars[] = {
   { "SRUN_ERROR", 'e' },
   { "SRUN_INPUT", 'i' },
   { "SRUN_OUTPUT", 'o' },
+  { "SRUN_SEGMENT_SIZE", LONG_OPT_SEGMENT_SIZE },
   { NULL }
 };
 
@@ -932,7 +939,7 @@ static bool _opt_verify(void)
 	 * If they are requesting block without 'nopack' and the system
 	 * is setup to pack nodes set it here.
 	 */
-	if ((slurm_conf.select_type_param & CR_PACK_NODES) &&
+	if ((slurm_conf.select_type_param & SELECT_PACK_NODES) &&
 	    !(opt.distribution & SLURM_DIST_NO_PACK_NODES) &&
 	    ((opt.distribution & SLURM_DIST_BLOCK) ||
 	     (opt.distribution == SLURM_DIST_UNKNOWN)))
@@ -940,14 +947,14 @@ static bool _opt_verify(void)
 
 	/*
 	 * If we are packing the nodes in an allocation set min_nodes to
-	 * 1. The slurmctld will adjust the max_nodes to the approriate
+	 * 1. The slurmctld will adjust the max_nodes to the appropriate
 	 * number if the allocation is homogeneous.
 	 */
 	if ((opt.distribution & SLURM_DIST_PACK_NODES) &&
 	    slurm_option_set_by_env(&opt, 'N')) {
 		opt.min_nodes = 1;
 		if (opt.verbose)
-			info("Reseting -N set by environment variable because of -mpack");
+			info("Resetting -N set by environment variable because of -mpack");
 		mpack_reset_nodes = true;
 	}
 
@@ -1494,6 +1501,7 @@ static void _usage(void)
 "            [--task-prolog=fname] [--task-epilog=fname]\n"
 "            [--ctrl-comm-ifhn=addr] [--multi-prog] [--mcs-label=mcs]\n"
 "            [--cpu-freq=min[-max[:gov]]] [--power=flags] [--spread-job]\n"
+"            [--spread-segments]\n"
 "            [--switches=max-switches{@max-time-to-wait}] [--reboot]\n"
 "            [--core-spec=cores] [--thread-spec=threads]\n"
 "            [--bb=burst_buffer_spec] [--bbf=burst_buffer_file]\n"
@@ -1545,7 +1553,7 @@ static void _help(void)
 "      --epilog=program        run \"program\" after launching job step\n"
 "  -E, --preserve-env          env vars for node and task counts override\n"
 "                              command-line flags\n"
-"      --gres=list             required generic resources\n"
+"      --gres=list             required generic resources per node\n"
 "      --gres-flags=opts       flags related to GRES management\n"
 "  -H, --hold                  submit job in held state\n"
 "  -i, --input=in              location of stdin redirection\n"
@@ -1602,6 +1610,7 @@ static void _help(void)
 "      --signal=[R:]num[@time] send signal when time limit within time seconds\n"
 "      --slurmd-debug=level    slurmd debug level\n"
 "      --spread-job            spread job across as many nodes as possible\n"
+"      --spread-segments       spread job segments across separate base blocks\n"
 "      --switches=max-switches{@max-time-to-wait}\n"
 "                              Optimum switches and max time to wait for optimum\n"
 "      --task-epilog=program   run \"program\" after launching task\n"
@@ -1616,6 +1625,8 @@ static void _help(void)
 "      --use-min-nodes         if a range of node counts is given, prefer the\n"
 "                              smaller count\n"
 "  -v, --verbose               verbose mode (multiple -v's increase verbosity)\n"
+"      --wait-for-children     wait for all children processes in a task to\n"
+"                              close before considering the task ended.\n"
 "  -W, --wait=sec              seconds to wait after first task exits\n"
 "                              before killing job\n"
 "      --wckey=wckey           wckey to run job under\n"

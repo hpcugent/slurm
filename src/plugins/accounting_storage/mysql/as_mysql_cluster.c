@@ -225,8 +225,9 @@ static int _setup_cluster_cond_limits(slurmdb_cluster_cond_t *cluster_cond,
 	return set;
 }
 
-extern uint16_t as_mysql_cluster_get_unique_id(
-	mysql_conn_t *mysql_conn, char *cluster_name)
+extern uint16_t as_mysql_cluster_get_unique_id(mysql_conn_t *mysql_conn,
+					       char *cluster_name,
+					       uint16_t requested_id)
 {
 	MYSQL_RES *result = NULL;
 	MYSQL_ROW row;
@@ -249,7 +250,13 @@ extern uint16_t as_mysql_cluster_get_unique_id(
 	mysql_free_result(result);
 
 	while (!id) {
-		id = generate_cluster_id();
+		/* try the requested id first */
+		if (requested_id > 0) {
+			id = requested_id;
+		} else {
+			requested_id = 0;
+			id = generate_cluster_id();
+		}
 
 		/* Test to make sure we aren't a duplicate */
 		query = xstrdup_printf("select id from %s where id=%u;",
@@ -263,6 +270,7 @@ extern uint16_t as_mysql_cluster_get_unique_id(
 		if (!num_rows)
 			break;
 		id = 0;
+		requested_id = 0;
 	}
 
 	return id;
@@ -310,6 +318,12 @@ extern int as_mysql_add_clusters(mysql_conn_t *mysql_conn, uint32_t uid,
 			error("We need a cluster name to add.");
 			rc = SLURM_ERROR;
 			list_remove(itr);
+			continue;
+		}
+		if (as_mysql_validate_cluster_name(object->name) !=
+		    SLURM_SUCCESS) {
+			rc = ESLURM_INVALID_CLUSTER_NAME;
+			list_delete_item(itr);
 			continue;
 		}
 		if ((object->flags != NO_VAL) &&
@@ -362,7 +376,8 @@ extern int as_mysql_add_clusters(mysql_conn_t *mysql_conn, uint32_t uid,
 			has_feds = 1;
 		}
 
-		id = as_mysql_cluster_get_unique_id(mysql_conn, object->name);
+		id = as_mysql_cluster_get_unique_id(mysql_conn, object->name,
+						    object->id);
 
 		xstrfmtcat(query,
 			   "insert into %s (creation_time, mod_time, "
@@ -423,8 +438,8 @@ extern int as_mysql_add_clusters(mysql_conn_t *mysql_conn, uint32_t uid,
 
 			/* Add root account */
 			xstrfmtcat(query,
-				   "insert into \"%s_%s\" (%s, lft, rgt, lineage) "
-				   "values (%s, 1, 2, '/') "
+				   "insert into \"%s_%s\" (%s, lineage) "
+				   "values (%s, '/') "
 				   "on duplicate key update deleted=0, "
 				   "id_assoc=LAST_INSERT_ID(id_assoc), lineage=VALUES(lineage)%s;",
 				   object->name, assoc_table, cols,
@@ -461,8 +476,6 @@ extern int as_mysql_add_clusters(mysql_conn_t *mysql_conn, uint32_t uid,
 			xfree(object->root_assoc->user);
 			object->root_assoc->id =
 				mysql_insert_id(mysql_conn->db_conn);
-			object->root_assoc->lft = 1;
-			object->root_assoc->rgt = 2;
 			xfree(object->root_assoc->lineage);
 			object->root_assoc->lineage = xstrdup("/");
 			if (addto_update_list(mysql_conn->update_list,
@@ -477,7 +490,7 @@ extern int as_mysql_add_clusters(mysql_conn_t *mysql_conn, uint32_t uid,
 			object->root_assoc = NULL;
 		}
 
-		/* Build up extra with cluster specfic values for txn table */
+		/* Build up extra with cluster specific values for txn table */
 		xstrfmtcat(extra,
 			   ", federation='%s', fed_id=%d, fed_state=%u, "
 			   "features='%s'",
@@ -541,6 +554,8 @@ extern int as_mysql_add_clusters(mysql_conn_t *mysql_conn, uint32_t uid,
 			assoc->user = xstrdup("root");
 			assoc->acct = xstrdup("root");
 			assoc->is_def = 1;
+			assoc->flags = ASSOC_FLAG_BLOCK_ADD;
+
 			/*
 			 * If the cluster is registering then don't add to the
 			 * update_list.
@@ -617,6 +632,10 @@ extern list_t *as_mysql_modify_clusters(mysql_conn_t *mysql_conn, uint32_t uid,
 		errno = ESLURM_ACCESS_DENIED;
 		return NULL;
 	}
+
+	if (as_mysql_validate_cluster_list(cluster_cond->cluster_list) !=
+	    SLURM_SUCCESS)
+		return NULL;
 
 	/* force to only do non-deleted clusters */
 	cluster_cond->with_deleted = 0;
@@ -822,18 +841,23 @@ extern list_t *as_mysql_remove_clusters(mysql_conn_t *mysql_conn, uint32_t uid,
 					slurmdb_cluster_cond_t *cluster_cond)
 {
 	list_itr_t *itr = NULL;
-	list_t *ret_list = NULL;
 	list_t *tmp_list = NULL;
 	int rc = SLURM_SUCCESS;
 	char *object = NULL;
-	char *extra = NULL, *query = NULL, *cluster_name = NULL,
-		*name_char = NULL, *assoc_char = NULL;
+	char *extra = NULL, *query = NULL, *cluster_name = NULL;
 	time_t now = time(NULL);
-	char *user_name = NULL;
 	slurmdb_wckey_cond_t wckey_cond;
 	MYSQL_RES *result = NULL;
 	MYSQL_ROW row;
-	bool jobs_running = 0, fed_update = false;
+	bool fed_update = false;
+
+	remove_common_args_t args = {
+		.jobs_running = false,
+		.mysql_conn = mysql_conn,
+		.now = now,
+		.table = cluster_table,
+		.type = DBD_REMOVE_CLUSTERS,
+	};
 
 	if (!cluster_cond) {
 		error("we need something to change");
@@ -848,6 +872,10 @@ extern list_t *as_mysql_remove_clusters(mysql_conn_t *mysql_conn, uint32_t uid,
 		errno = ESLURM_ACCESS_DENIED;
 		return NULL;
 	}
+
+	if (as_mysql_validate_cluster_list(cluster_cond->cluster_list) !=
+	    SLURM_SUCCESS)
+		return NULL;
 
 	/* force to only do non-deleted clusters */
 	cluster_cond->with_deleted = 0;
@@ -867,7 +895,7 @@ extern list_t *as_mysql_remove_clusters(mysql_conn_t *mysql_conn, uint32_t uid,
 		return NULL;
 	}
 	rc = 0;
-	ret_list = list_create(xfree_ptr);
+	args.ret_list = list_create(xfree_ptr);
 
 	if (!mysql_num_rows(result)) {
 		mysql_free_result(result);
@@ -875,55 +903,54 @@ extern list_t *as_mysql_remove_clusters(mysql_conn_t *mysql_conn, uint32_t uid,
 		DB_DEBUG(DB_ASSOC, mysql_conn->conn,
 		         "didn't affect anything\n%s", query);
 		xfree(query);
-		return ret_list;
+		return args.ret_list;
 	}
 	xfree(query);
 
-	assoc_char = xstrdup_printf("t2.lineage like '/%%'");
+	args.assoc_char = xstrdup_printf("t2.lineage like '/%%'");
+	args.user_name = uid_to_string((uid_t) uid);
 
-	user_name = uid_to_string((uid_t) uid);
 	while ((row = mysql_fetch_row(result))) {
 		char *object = xstrdup(row[0]);
-		if (!jobs_running) {
+		if (!args.jobs_running) {
 			/* strdup the cluster name because ret_list will be
 			 * flushed if there are running jobs. This will cause an
 			 * invalid read because _check_jobs_before_remove() will
 			 * still try to access "cluster_name" which was
 			 * "object". */
-			list_append(ret_list, xstrdup(object));
+			list_append(args.ret_list, xstrdup(object));
 		}
 
 		if (row[1] && (*row[1] != '\0'))
 			fed_update = true;
 
-		xfree(name_char);
-		xstrfmtcat(name_char, "name='%s'", object);
+		xfree(args.name_char);
+		xstrfmtcat(args.name_char, "name='%s'", object);
 
-		rc = remove_common(mysql_conn, DBD_REMOVE_CLUSTERS, now,
-				   user_name, cluster_table, name_char,
-				   assoc_char, object, ret_list, &jobs_running,
-				   NULL);
+		args.cluster_name = object;
+		rc = remove_common(&args);
+
 		xfree(object);
 		if (rc != SLURM_SUCCESS)
 			break;
 	}
 	mysql_free_result(result);
-	xfree(user_name);
-	xfree(name_char);
-	xfree(assoc_char);
+	xfree(args.user_name);
+	xfree(args.name_char);
+	xfree(args.assoc_char);
 
 	if (rc != SLURM_SUCCESS) {
-		FREE_NULL_LIST(ret_list);
+		FREE_NULL_LIST(args.ret_list);
 		return NULL;
 	}
-	if (!jobs_running) {
+	if (!args.jobs_running) {
 		/* We need to remove these clusters from the wckey table */
 		memset(&wckey_cond, 0, sizeof(slurmdb_wckey_cond_t));
-		wckey_cond.cluster_list = ret_list;
+		wckey_cond.cluster_list = args.ret_list;
 		tmp_list = as_mysql_remove_wckeys(mysql_conn, uid, &wckey_cond);
 		FREE_NULL_LIST(tmp_list);
 
-		itr = list_iterator_create(ret_list);
+		itr = list_iterator_create(args.ret_list);
 		while ((object = list_next(itr))) {
 			if ((rc = remove_cluster_tables(mysql_conn, object))
 			    != SLURM_SUCCESS)
@@ -938,7 +965,7 @@ extern list_t *as_mysql_remove_clusters(mysql_conn_t *mysql_conn, uint32_t uid,
 
 		if (rc != SLURM_SUCCESS) {
 			reset_mysql_conn(mysql_conn);
-			FREE_NULL_LIST(ret_list);
+			FREE_NULL_LIST(args.ret_list);
 			errno = rc;
 			return NULL;
 		}
@@ -952,7 +979,7 @@ extern list_t *as_mysql_remove_clusters(mysql_conn_t *mysql_conn, uint32_t uid,
 
 	xfree(query);
 
-	return ret_list;
+	return args.ret_list;
 }
 
 extern list_t *as_mysql_get_clusters(mysql_conn_t *mysql_conn, uid_t uid,
@@ -979,6 +1006,7 @@ extern list_t *as_mysql_get_clusters(mysql_conn_t *mysql_conn, uid_t uid,
 		"classification",
 		"control_host",
 		"control_port",
+		"deleted",
 		"features",
 		"federation",
 		"fed_id",
@@ -993,6 +1021,7 @@ extern list_t *as_mysql_get_clusters(mysql_conn_t *mysql_conn, uid_t uid,
 		CLUSTER_REQ_CLASS,
 		CLUSTER_REQ_CH,
 		CLUSTER_REQ_CP,
+		CLUSTER_REQ_DELETED,
 		CLUSTER_REQ_FEATURES,
 		CLUSTER_REQ_FEDR,
 		CLUSTER_REQ_FEDID,
@@ -1011,6 +1040,10 @@ extern list_t *as_mysql_get_clusters(mysql_conn_t *mysql_conn, uid_t uid,
 		xstrcat(extra, " where deleted=0");
 		goto empty;
 	}
+
+	if (as_mysql_validate_cluster_list(cluster_cond->cluster_list) !=
+	    SLURM_SUCCESS)
+		return NULL;
 
 	_setup_cluster_cond_limits(cluster_cond, &extra);
 
@@ -1077,6 +1110,10 @@ empty:
 		cluster->rpc_version = slurm_atoul(row[CLUSTER_REQ_VERSION]);
 		cluster->dimensions = slurm_atoul(row[CLUSTER_REQ_DIMS]);
 		cluster->flags = slurm_atoul(row[CLUSTER_REQ_FLAGS]);
+
+		if (row[CLUSTER_REQ_DELETED] &&
+		    (row[CLUSTER_REQ_DELETED][0] == '1'))
+			cluster->flags |= CLUSTER_FLAG_DELETED;
 
 		query = xstrdup_printf(
 			"select tres, cluster_nodes from "
@@ -1189,6 +1226,10 @@ extern list_t *as_mysql_get_cluster_events(mysql_conn_t *mysql_conn, uint32_t ui
 
 	if (!event_cond)
 		goto empty;
+
+	if (as_mysql_validate_cluster_list(event_cond->cluster_list) !=
+	    SLURM_SUCCESS)
+		return NULL;
 
 	if (event_cond->cpus_min) {
 		if (extra)
@@ -1589,6 +1630,10 @@ extern list_t *as_mysql_get_instances(mysql_conn_t *mysql_conn, uint32_t uid,
 		}
 	}
 
+	if (instance_cond &&
+	    (as_mysql_validate_cluster_list(instance_cond->cluster_list) !=
+	     SLURM_SUCCESS))
+		return NULL;
 
 	/* determine cluster list */
 	if (instance_cond && instance_cond->cluster_list &&
@@ -1800,7 +1845,7 @@ extern int as_mysql_node_down(mysql_conn_t *mysql_conn,
 		 * database. If this is the case we will zero out the time_end
 		 * we are just filled in. This will cause the last time to be
 		 * erased from the last restart, but if you are restarting
-		 * things this often the pervious one didn't mean anything
+		 * things this often the previous one didn't mean anything
 		 * anyway. This way we only get one for the last time we let it
 		 * run.
 		 */
@@ -1834,7 +1879,7 @@ extern int as_mysql_node_down(mysql_conn_t *mysql_conn,
 	 * the state of the "node_state" state file. If the the slurmctld is
 	 * "killed" before updating the state file, the slurmctld can send the
 	 * same time_start for the node and cause a "Duplicate entry" error.
-	 * This can particually happen when doing clean starts.
+	 * This can particularly happen when doing clean starts.
 	 */
 	xstrfmtcat(query,
 		   "insert into \"%s_%s\" "

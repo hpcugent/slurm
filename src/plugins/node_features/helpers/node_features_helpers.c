@@ -147,7 +147,8 @@ static void _make_uid_array(char *uid_str)
 	tmp_str = xstrdup(uid_str);
 	tok = strtok_r(tmp_str, ",", &save_ptr);
 	while (tok) {
-		if (uid_from_string(tok, &allowed_uid[allowed_uid_cnt++]) < 0)
+		if (uid_from_string(tok, &allowed_uid[allowed_uid_cnt++]) !=
+		    SLURM_SUCCESS)
 			fatal("helpers.conf: Invalid AllowUserBoot: %s", tok);
 		tok = strtok_r(NULL, ",", &save_ptr);
 	}
@@ -615,14 +616,12 @@ extern int init(void)
 	return _read_config_file();
 }
 
-extern int fini(void)
+extern void fini(void)
 {
 	FREE_NULL_LIST(helper_features);
 	FREE_NULL_LIST(helper_exclusives);
 	xfree(allowed_uid);
 	allowed_uid_cnt = 0;
-
-	return SLURM_SUCCESS;
 }
 
 extern bool node_features_p_changeable_feature(char *input)
@@ -944,12 +943,6 @@ extern char *node_features_p_job_xlate(char *job_features,
 	return _xlate_job_features(job_features, feature_list, job_node_bitmap);
 }
 
-/* Return true if the plugin requires PowerSave mode for booting nodes */
-extern bool node_features_p_node_power(void)
-{
-	return false;
-}
-
 static char *_make_helper_str(const plugin_feature_t *feature)
 {
 	char *str = NULL;
@@ -1062,33 +1055,8 @@ extern bool node_features_p_user_update(uid_t uid)
 	return false;
 }
 
-extern void node_features_p_step_config(bool mem_sort, bitstr_t *numa_bitmap)
-{
-	return;
-}
-
 extern int node_features_p_overlap(bitstr_t *active_bitmap)
 {
 	/* Executed on slurmctld and not used by this plugin */
 	return bit_set_count(active_bitmap);
-}
-
-extern int node_features_p_get_node(char *node_list)
-{
-	/* Executed on slurmctld and not used by this plugin */
-	return SLURM_SUCCESS;
-}
-
-extern int node_features_p_node_update(char *active_features,
-				       bitstr_t *node_bitmap)
-{
-	/* Executed on slurmctld and not used by this plugin */
-	return SLURM_SUCCESS;
-}
-
-extern bool node_features_p_node_update_valid(void *node_ptr,
-					      update_node_msg_t *update_node_msg)
-{
-	/* Executed on slurmctld and not used by this plugin */
-	return true;
 }

@@ -179,7 +179,6 @@ typedef struct fmt_data {
 struct sinfo_parameters {
 	bool all_flag;
 	list_t *clusters;
-	uint32_t cluster_flags;
 	char *cluster_names;
 	uint32_t convert_flags;
 	bool dead_nodes;
@@ -221,6 +220,16 @@ struct sinfo_parameters {
 
 	slurmdb_federation_rec_t *fed;
 };
+
+typedef enum {
+	SINFO_STATE_OP_NORM = 0,
+	SINFO_STATE_OP_NOT
+} sinfo_state_op_t;
+
+typedef struct {
+	uint32_t state;
+	sinfo_state_op_t op;
+} sinfo_state_t;
 
 extern struct sinfo_parameters params;
 

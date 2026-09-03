@@ -78,10 +78,9 @@ extern int send_resvs_to_accounting(int db_rc);
 
 /*
  * Set or clear NODE_STATE_MAINT for node_state as needed
- * IN reset_all - re-initialize all node information for all reservations
  * RET count of newly started reservations
  */
-extern int set_node_maint_mode(bool reset_all);
+extern int set_node_maint_mode(void);
 
 /* checks if node within node_record_table_ptr is in maint reservation */
 extern bool is_node_in_maint_reservation(int nodenum);
@@ -91,7 +90,7 @@ extern void update_assocs_in_resvs(void);
 
 /*
  * Update reserved nodes for all reservations using a specific partition if the
- * resevation has NodeList=ALL and RESERVE_FLAGS_PART_NODES.
+ * reservation has NodeList=ALL and RESERVE_FLAGS_PART_NODES.
 */
 extern void update_part_nodes_in_resv(part_record_t *part_ptr);
 
@@ -111,10 +110,23 @@ extern int load_all_resv_state(int recover);
  * Request validation of all reservation records, reset bitmaps, etc.
  * Will purge any invalid reservation.
  *
- * IN run_now - true: apply changes now if previously called
- *              false: defer changes until called with run_now=true
+ * IN run_now    - true: apply changes now if previously called
+ *                 false: defer changes until called with run_now=true
+ * IN run_locked - true: if applying changes, do it locking first
+ *                 false: assume we locked earlier, or not needed
+ *                 NOTE: Ignored if run_now==false
  */
-extern void validate_all_reservations(bool run_now);
+extern void validate_all_reservations(bool run_now, bool run_locked);
+
+/*
+ * Re-resolve a reservation's qos_list pointers from its canonical qos string.
+ * Used by the assoc_mgr cache-update path after the qos list has been replaced,
+ * which leaves the qos_rec pointers cached in resv_ptr->qos_list dangling.
+ * IN x   - reservation to update (slurmctld_resv_t *)
+ * IN arg - unused
+ * RET 0
+ */
+extern int resv_cache_update_qos_list(void *x, void *arg);
 
 /*
  * Determine if a job request can use the specified reservations
@@ -142,12 +154,12 @@ extern burst_buffer_info_msg_t *job_test_bb_resv(job_record_t *job_ptr,
  *	prevented from using due to reservations
  *
  * IN job_ptr   - job to test
- * IN lic_name  - name of license
+ * IN id        - id of license
  * IN when      - when the job is expected to start
  * IN reboot    - true if node reboot required to start job
  * RET number of licenses of this type the job is prevented from using
  */
-extern int job_test_lic_resv(job_record_t *job_ptr, char *lic_name,
+extern int job_test_lic_resv(job_record_t *job_ptr, licenses_id_t id,
 			     time_t when, bool reboot);
 
 /*

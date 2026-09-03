@@ -41,7 +41,11 @@ strong_alias(cgroup_conf_destroy, slurm_cgroup_conf_destroy);
 strong_alias(autodetect_cgroup_version, slurm_autodetect_cgroup_version);
 
 #define DEFAULT_CGROUP_BASEDIR "/sys/fs/cgroup"
+#ifdef WITH_CGROUP
 #define DEFAULT_CGROUP_PLUGIN "autodetect"
+#else
+#define DEFAULT_CGROUP_PLUGIN "disabled"
+#endif
 
 /* Symbols provided by the plugin */
 typedef struct {
@@ -76,7 +80,15 @@ typedef struct {
 	long int (*get_acct_units)	(void);
 	bool (*has_feature) (cgroup_ctl_feature_t f);
 	char *(*get_scope_path)(void);
+	int (*bpf_fsopen)(void);
+	int (*bpf_fsconfig)(int fd);
+	int (*bpf_create_token)(int fd);
+	void (*bpf_set_token)(int fd);
+	int (*bpf_get_token)(void);
 	int (*setup_scope)(char *scope_path);
+	int (*signal)(int signal);
+	char *(*get_task_empty_event_path)(uint32_t taskid, bool *on_modify);
+	int (*is_task_empty)(uint32_t taskid);
 } slurm_ops_t;
 
 /*
@@ -105,7 +117,15 @@ static const char *syms[] = {
 	"cgroup_p_get_acct_units",
 	"cgroup_p_has_feature",
 	"cgroup_p_get_scope_path",
+	"cgroup_p_bpf_fsopen",
+	"cgroup_p_bpf_fsconfig",
+	"cgroup_p_bpf_create_token",
+	"cgroup_p_bpf_set_token",
+	"cgroup_p_bpf_get_token",
 	"cgroup_p_setup_scope",
+	"cgroup_p_signal",
+	"cgroup_p_get_task_empty_event_path",
+	"cgroup_p_is_task_empty",
 };
 
 /* Local variables */
@@ -156,6 +176,8 @@ static void _clear_slurm_cgroup_conf(void)
 	xfree(slurm_cgroup_conf.cgroup_mountpoint);
 	xfree(slurm_cgroup_conf.cgroup_plugin);
 	xfree(slurm_cgroup_conf.cgroup_prepend);
+	xfree(slurm_cgroup_conf.cgroup_slice);
+	xfree(slurm_cgroup_conf.enable_extra_controllers);
 
 	memset(&slurm_cgroup_conf, 0, sizeof(slurm_cgroup_conf));
 }
@@ -173,11 +195,13 @@ static void _init_slurm_cgroup_conf(void)
 #else
 	slurm_cgroup_conf.cgroup_prepend = xstrdup("/slurm_%n");
 #endif
+	slurm_cgroup_conf.cgroup_slice = NULL;
 	slurm_cgroup_conf.constrain_cores = false;
 	slurm_cgroup_conf.constrain_devices = false;
 	slurm_cgroup_conf.constrain_ram_space = false;
 	slurm_cgroup_conf.constrain_swap_space = false;
 	slurm_cgroup_conf.enable_controllers = false;
+	slurm_cgroup_conf.enable_extra_controllers = NULL;
 	slurm_cgroup_conf.ignore_systemd = false;
 	slurm_cgroup_conf.ignore_systemd_on_failure = false;
 	slurm_cgroup_conf.max_ram_percent = 100;
@@ -203,6 +227,7 @@ static void _pack_cgroup_conf(buf_t *buffer)
 	packstr(slurm_cgroup_conf.cgroup_mountpoint, buffer);
 
 	packstr(slurm_cgroup_conf.cgroup_prepend, buffer);
+	packstr(slurm_cgroup_conf.cgroup_slice, buffer);
 
 	packbool(slurm_cgroup_conf.constrain_cores, buffer);
 
@@ -224,6 +249,7 @@ static void _pack_cgroup_conf(buf_t *buffer)
 	packbool(slurm_cgroup_conf.ignore_systemd_on_failure, buffer);
 
 	packbool(slurm_cgroup_conf.enable_controllers, buffer);
+	packstr(slurm_cgroup_conf.enable_extra_controllers, buffer);
 	packbool(slurm_cgroup_conf.signal_children_processes, buffer);
 	pack64(slurm_cgroup_conf.systemd_timeout, buffer);
 }
@@ -246,6 +272,7 @@ static int _unpack_cgroup_conf(buf_t *buffer)
 	safe_unpackstr(&slurm_cgroup_conf.cgroup_mountpoint, buffer);
 
 	safe_unpackstr(&slurm_cgroup_conf.cgroup_prepend, buffer);
+	safe_unpackstr(&slurm_cgroup_conf.cgroup_slice, buffer);
 
 	safe_unpackbool(&slurm_cgroup_conf.constrain_cores, buffer);
 
@@ -267,6 +294,7 @@ static int _unpack_cgroup_conf(buf_t *buffer)
 	safe_unpackbool(&slurm_cgroup_conf.ignore_systemd_on_failure, buffer);
 
 	safe_unpackbool(&slurm_cgroup_conf.enable_controllers, buffer);
+	safe_unpackstr(&slurm_cgroup_conf.enable_extra_controllers, buffer);
 	safe_unpackbool(&slurm_cgroup_conf.signal_children_processes, buffer);
 	safe_unpack64(&slurm_cgroup_conf.systemd_timeout, buffer);
 
@@ -287,7 +315,7 @@ static void _read_slurm_cgroup_conf(void)
 	s_p_options_t options[] = {
 		{"CgroupAutomount", S_P_BOOLEAN, _defunct_option},
 		{"CgroupMountpoint", S_P_STRING},
-		{"CgroupReleaseAgentDir", S_P_STRING},
+		{"CgroupSlice", S_P_STRING},
 		{"ConstrainCores", S_P_BOOLEAN},
 		{"ConstrainRAMSpace", S_P_BOOLEAN},
 		{"AllowedRAMSpace", S_P_FLOAT},
@@ -305,6 +333,7 @@ static void _read_slurm_cgroup_conf(void)
 		{"IgnoreSystemd", S_P_BOOLEAN},
 		{"IgnoreSystemdOnFailure", S_P_BOOLEAN},
 		{"EnableControllers", S_P_BOOLEAN},
+		{"EnableExtraControllers", S_P_STRING},
 		{"SignalChildrenProcesses", S_P_BOOLEAN},
 		{"SystemdTimeout", S_P_UINT64},
 		{NULL} };
@@ -339,9 +368,11 @@ static void _read_slurm_cgroup_conf(void)
 			slurm_cgroup_conf.cgroup_mountpoint = tmp_str;
 			tmp_str = NULL;
 		}
-		if (s_p_get_string(&tmp_str, "CgroupReleaseAgentDir", tbl)) {
-			xfree(tmp_str);
-			fatal("Support for CgroupReleaseAgentDir option has been removed.");
+
+		if (s_p_get_string(&tmp_str, "CgroupSlice", tbl)) {
+			xfree(slurm_cgroup_conf.cgroup_slice);
+			slurm_cgroup_conf.cgroup_slice = tmp_str;
+			tmp_str = NULL;
 		}
 
 		/* Cores constraints related conf items */
@@ -407,6 +438,11 @@ static void _read_slurm_cgroup_conf(void)
 
 		(void) s_p_get_boolean(&slurm_cgroup_conf.enable_controllers,
 				       "EnableControllers", tbl);
+		if (s_p_get_string(&tmp_str, "EnableExtraControllers", tbl)) {
+			xfree(slurm_cgroup_conf.enable_extra_controllers);
+			slurm_cgroup_conf.enable_extra_controllers = tmp_str;
+			tmp_str = NULL;
+		}
 		(void) s_p_get_boolean(
 			&slurm_cgroup_conf.signal_children_processes,
 			"SignalChildrenProcesses", tbl);
@@ -475,9 +511,11 @@ extern char *autodetect_cgroup_version(void)
 		error("unsupported cgroup version %d", cgroup_ver);
 		break;
 	}
-#endif
 
 	return NULL;
+#else
+	return "disabled";
+#endif
 }
 
 /*
@@ -564,6 +602,7 @@ extern list_t *cgroup_get_conf_list(void)
 
 	add_key_pair(cgroup_conf_l, "CgroupMountpoint", "%s",
 		     cg_conf->cgroup_mountpoint);
+	add_key_pair(cgroup_conf_l, "CgroupSlice", "%s", cg_conf->cgroup_slice);
 	add_key_pair_bool(cgroup_conf_l, "ConstrainCores",
 			  cg_conf->constrain_cores);
 	add_key_pair_bool(cgroup_conf_l, "ConstrainRAMSpace",
@@ -590,6 +629,8 @@ extern list_t *cgroup_get_conf_list(void)
 			  cg_conf->ignore_systemd_on_failure);
 	add_key_pair_bool(cgroup_conf_l, "EnableControllers",
 			  cg_conf->enable_controllers);
+	add_key_pair(cgroup_conf_l, "EnableExtraControllers", "%s",
+		     cg_conf->enable_extra_controllers);
 
 	if (cg_conf->memory_swappiness != NO_VAL64)
 		add_key_pair(cgroup_conf_l, "MemorySwappiness", "%"PRIu64,
@@ -741,17 +782,21 @@ extern int cgroup_g_init(void)
 
 	type = slurm_cgroup_conf.cgroup_plugin;
 
-	if (!xstrcmp(type, "disabled")) {
-		plugin_inited = PLUGIN_NOOP;
-		goto done;
-	}
-
 	if (!xstrcmp(type, "autodetect")) {
 		if (!(type = autodetect_cgroup_version())) {
 			rc = SLURM_ERROR;
 			goto done;
 		}
 	}
+
+	if (!xstrcmp(type, "disabled")) {
+		plugin_inited = PLUGIN_NOOP;
+		goto done;
+	}
+
+	if (running_in_slurmd())
+		if (!xstrcmp(type, "cgroup/v1"))
+			warning("cgroup/v1 plugin is deprecated, please upgrade to cgroup/v2 at your earliest convenience");
 
 	g_context = plugin_context_create(
 		plugin_type, type, (void **)&ops, syms, sizeof(syms));
@@ -840,26 +885,40 @@ extern int cgroup_g_system_destroy(cgroup_ctl_type_t sub)
 
 extern int cgroup_g_step_create(cgroup_ctl_type_t sub, stepd_step_rec_t *step)
 {
+	int rc;
+
 	xassert(plugin_inited != PLUGIN_NOT_INITED);
 
 	if (plugin_inited == PLUGIN_NOOP)
 		return SLURM_SUCCESS;
 
-	return (*(ops.step_create))(sub, step);
+	slurm_mutex_lock(&g_context_lock);
+	rc = (*(ops.step_create))(sub, step);
+	slurm_mutex_unlock(&g_context_lock);
+
+	return rc;
 }
 
 extern int cgroup_g_step_addto(cgroup_ctl_type_t sub, pid_t *pids, int npids)
 {
+	int rc;
+
 	xassert(plugin_inited != PLUGIN_NOT_INITED);
 
 	if (plugin_inited == PLUGIN_NOOP)
 		return SLURM_SUCCESS;
 
-	return (*(ops.step_addto))(sub, pids, npids);
+	slurm_mutex_lock(&g_context_lock);
+	rc = (*(ops.step_addto))(sub, pids, npids);
+	slurm_mutex_unlock(&g_context_lock);
+
+	return rc;
 }
 
 extern int cgroup_g_step_get_pids(pid_t **pids, int *npids)
 {
+	int rc;
+
 	xassert(plugin_inited != PLUGIN_NOT_INITED);
 
 	if (plugin_inited == PLUGIN_NOOP) {
@@ -868,7 +927,11 @@ extern int cgroup_g_step_get_pids(pid_t **pids, int *npids)
 		return SLURM_SUCCESS;
 	}
 
-	return (*(ops.step_get_pids))(pids, npids);
+	slurm_mutex_lock(&g_context_lock);
+	rc = (*(ops.step_get_pids))(pids, npids);
+	slurm_mutex_unlock(&g_context_lock);
+
+	return rc;
 }
 
 extern int cgroup_g_step_suspend(void)
@@ -893,22 +956,34 @@ extern int cgroup_g_step_resume(void)
 
 extern int cgroup_g_step_destroy(cgroup_ctl_type_t sub)
 {
+	int rc;
+
 	xassert(plugin_inited != PLUGIN_NOT_INITED);
 
 	if (plugin_inited == PLUGIN_NOOP)
 		return SLURM_SUCCESS;
 
-	return (*(ops.step_destroy))(sub);
+	slurm_mutex_lock(&g_context_lock);
+	rc = (*(ops.step_destroy))(sub);
+	slurm_mutex_unlock(&g_context_lock);
+
+	return rc;
 }
 
 extern bool cgroup_g_has_pid(pid_t pid)
 {
+	int rc;
+
 	xassert(plugin_inited != PLUGIN_NOT_INITED);
 
 	if (plugin_inited == PLUGIN_NOOP)
 		return false;
 
-	return (*(ops.has_pid))(pid);
+	slurm_mutex_lock(&g_context_lock);
+	rc = (*(ops.has_pid))(pid);
+	slurm_mutex_unlock(&g_context_lock);
+
+	return rc;
 }
 
 extern cgroup_limits_t *cgroup_g_constrain_get(cgroup_ctl_type_t sub,
@@ -969,12 +1044,18 @@ extern cgroup_oom_t *cgroup_g_step_stop_oom_mgr(stepd_step_rec_t *step)
 extern int cgroup_g_task_addto(cgroup_ctl_type_t sub, stepd_step_rec_t *step,
 			       pid_t pid, uint32_t task_id)
 {
+	int rc;
+
 	xassert(plugin_inited != PLUGIN_NOT_INITED);
 
 	if (plugin_inited == PLUGIN_NOOP)
 		return SLURM_SUCCESS;
 
-	return (*(ops.task_addto))(sub, step, pid, task_id);
+	slurm_mutex_lock(&g_context_lock);
+	rc = (*(ops.task_addto))(sub, step, pid, task_id);
+	slurm_mutex_unlock(&g_context_lock);
+
+	return rc;
 }
 
 extern cgroup_acct_t *cgroup_g_task_get_acct_data(uint32_t taskid)
@@ -1007,4 +1088,84 @@ extern bool cgroup_g_has_feature(cgroup_ctl_feature_t f)
 		return false;
 
 	return (*(ops.has_feature))(f);
+}
+
+extern int cgroup_g_signal(int signal)
+{
+	xassert(plugin_inited != PLUGIN_NOT_INITED);
+
+	if (plugin_inited == PLUGIN_NOOP)
+		return SLURM_SUCCESS;
+
+	return (*(ops.signal))(signal);
+}
+
+extern char *cgroup_g_get_task_empty_event_path(uint32_t taskid,
+						bool *on_modify)
+{
+	xassert(plugin_inited != PLUGIN_NOT_INITED);
+
+	if (plugin_inited == PLUGIN_NOOP)
+		return SLURM_SUCCESS;
+
+	return (*(ops.get_task_empty_event_path))(taskid, on_modify);
+}
+
+extern int cgroup_g_is_task_empty(uint32_t taskid)
+{
+	xassert(plugin_inited != PLUGIN_NOT_INITED);
+
+	if (plugin_inited == PLUGIN_NOOP)
+		return SLURM_SUCCESS;
+
+	return (*(ops.is_task_empty))(taskid);
+}
+
+extern int cgroup_g_bpf_fsopen()
+{
+	xassert(plugin_inited != PLUGIN_NOT_INITED);
+
+	if (plugin_inited == PLUGIN_NOOP)
+		return SLURM_ERROR;
+
+	return (*(ops.bpf_fsopen))();
+}
+
+extern int cgroup_g_bpf_fsconfig(int fd)
+{
+	xassert(plugin_inited != PLUGIN_NOT_INITED);
+
+	if (plugin_inited == PLUGIN_NOOP)
+		return SLURM_ERROR;
+
+	return (*(ops.bpf_fsconfig))(fd);
+}
+
+extern int cgroup_g_bpf_create_token(int fd)
+{
+	xassert(plugin_inited != PLUGIN_NOT_INITED);
+
+	if (plugin_inited == PLUGIN_NOOP)
+		return SLURM_ERROR;
+
+	return (*(ops.bpf_create_token))(fd);
+}
+
+extern int cgroup_g_bpf_get_token()
+{
+	xassert(plugin_inited != PLUGIN_NOT_INITED);
+	if (plugin_inited == PLUGIN_NOOP)
+		return SLURM_ERROR;
+
+	return (*(ops.bpf_get_token))();
+}
+
+extern void cgroup_g_bpf_set_token(int fd)
+{
+	xassert(plugin_inited != PLUGIN_NOT_INITED);
+
+	if (plugin_inited == PLUGIN_NOOP)
+		return;
+
+	(*(ops.bpf_set_token))(fd);
 }

@@ -40,8 +40,10 @@
 #include "src/slurmrestd/http.h"
 #include "src/slurmrestd/openapi.h"
 
-extern serializer_flags_t yaml_flags;
-extern serializer_flags_t json_flags;
+/*
+ * True if slurmrestd is running in inetd mode
+ */
+extern bool inetd_mode;
 
 /*
  * setup locks.

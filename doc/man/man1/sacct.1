@@ -1,4 +1,4 @@
-.TH sacct "1" "Slurm Commands" "April 2025" "Slurm Commands"
+.TH sacct "1" "Slurm Commands" "Slurm 25.11" "Slurm Commands"
 
 .SH "NAME"
 sacct \- displays accounting data for all jobs and job steps in the
@@ -37,9 +37,6 @@ with the \f3\-\-allusers\fP, \f3\-\-user\fP, or \f3\-\-uid\fP options.
 Elapsed time fields are presented as
 [days\-]hours:minutes:seconds[.microseconds]. Only 'CPU' fields will
 ever have microseconds.
-.PP
-The default input file is the file named in the
-\f3AccountingStorageLoc\fP parameter in slurm.conf.
 
 \fBNOTE\fR: If designated, the slurmdbd.conf option PrivateData may further
 restrict the accounting data visible to users which are not
@@ -153,20 +150,11 @@ are not specified.
 
 .TP
 \fB\-D\fR, \fB\-\-duplicates\fR
-If Slurm job ids are reset, some job numbers will probably appear more
-than once in the accounting log file but refer to different jobs.
-Such jobs can be distinguished by the "submit" time stamp in the data
-records.
-.IP
-
-When data for specific jobs are requested with the \-\-jobs option,
-\fBsacct\fR returns the most recent job with that number. This
-behavior can be overridden by specifying \-\-duplicates, in which case
-all records that match the selection criteria will be returned.
-.IP
-
-\fBNOTE\fR: Revoked federated sibling jobs are hidden unless the
-\fB\-\-duplicates\fR option is specified.
+Allow multiple job records for the same job ID to be shown. By default, if
+multiple job records for the same job ID match the request, only the most recent
+one will be shown. Duplicate records can result from requeues, federation, or
+from job IDs reaching the \fBMaxJobId\fR value and resetting. Such records can
+be distinguished by the \fBSubmit\fR time stamp or by the \fBSLUID\fR.
 .IP
 
 .TP
@@ -291,17 +279,17 @@ NodeList            NTasks              Partition           Planned
 PlannedCPU          PlannedCPURAW       Priority            QOS
 QOSRAW              QOSREQ              Reason              ReqCPUFreq
 ReqCPUFreqGov       ReqCPUFreqMax       ReqCPUFreqMin       ReqCPUS
-ReqMem              ReqNodes            ReqTRES             Reservation
-ReservationId       Restarts            SLUID               Start
-State               StdErr              StdIn               StdOut
-Submit              SubmitLine          Suspended           SystemComment
-SystemCPU           Timelimit           TimelimitRaw        TotalCPU
-TRESUsageInAve      TRESUsageInMax      TRESUsageInMaxNode  TRESUsageInMaxTask
-TRESUsageInMin      TRESUsageInMinNode  TRESUsageInMinTask  TRESUsageInTot
-TRESUsageOutAve     TRESUsageOutMax     TRESUsageOutMaxNode TRESUsageOutMaxTask
-TRESUsageOutMin     TRESUsageOutMinNode TRESUsageOutMinTask TRESUsageOutTot
-UID                 User                UserCPU             WCKey
-WCKeyID             WorkDir
+ReqMem              ReqNodes            ReqTRES             ReqReservation
+Reservation         ReservationId       Restarts            SegmentSize
+SLUID               Start               State               StdErr
+StdIn               StdOut              Submit              SubmitLine
+Suspended           SystemComment       SystemCPU           Timelimit
+TimelimitRaw        TotalCPU            TRESUsageInAve      TRESUsageInMax
+TRESUsageInMaxNode  TRESUsageInMaxTask  TRESUsageInMin      TRESUsageInMinNode
+TRESUsageInMinTask  TRESUsageInTot      TRESUsageOutAve     TRESUsageOutMax
+TRESUsageOutMaxNode TRESUsageOutMaxTask TRESUsageOutMin     TRESUsageOutMinNode
+TRESUsageOutMinTask TRESUsageOutTot     UID                 User
+UserCPU             WCKey               WCKeyID             WorkDir
 .ft 1
 .fi
 .RE
@@ -1078,6 +1066,11 @@ For more details see AccountingStorageTRES in slurm.conf.
 .IP
 
 .TP
+\f3ReqReservation\fP
+Comma separated list of reservation names requested by the job.
+.IP
+
+.TP
 \f3Reservation\fP
 Reservation Name.
 .IP
@@ -1090,6 +1083,21 @@ Reservation Id.
 .TP
 \f3Restarts\fP
 How many times this job has been requeued/restarted.
+.IP
+
+.TP
+\f3SegmentSize\fP
+When a block topology is used, this is the size of the segments that will be
+used to create the job allocation.
+.IP
+
+.TP
+\f3SLUID\fP
+A unique identifier for a specific run of a job. Unlike a job ID, the SLUID
+changes each time a job is requeued/restarted, allowing different runs of
+the same job to be distinguished. Previous runs of the job can be shown with
+the \fB\-D\fR/\fB\-\-duplicates\fR option. SLUIDs are globally unique across the
+accounting system.
 .IP
 
 .TP
@@ -1120,22 +1128,22 @@ appropriate state(s) without the RUNNING state.
 .TP
 \f3StdErr\fP
 Display the "\fIfilename pattern\fR" for stderr redirection specified in a
-batch job. Path wildcards will not be substituted and will be shown as defined
-in the original batch submission.
+job or in job steps. Path wildcards will not be substituted and will be
+shown as defined in the original batch submission.
 .IP
 
 .TP
 \f3StdIn\fP
 Display the "\fIfilename pattern\fR" for stdin redirection specified in a
-batch job. Path wildcards will not be substituted and will be shown as defined
-in the original batch submission.
+job or in job steps. Path wildcards will not be substituted and will be
+shown as defined in the original batch submission.
 .IP
 
 .TP
 \f3StdOut\fP
 Display the "\fIfilename pattern\fR" for stdout redirection specified in a
-batch job. Path wildcards will not be substituted and will be shown as defined
-in the original batch submission.
+job or in job steps. Path wildcards will not be substituted and will be
+shown as defined in the original batch submission.
 .IP
 
 .TP
@@ -1143,8 +1151,8 @@ in the original batch submission.
 The time the job was submitted. In the same format as \f3End\fP.
 
 \fBNOTE\fR: If a job is requeued, the submit time is reset. To obtain the
-original submit time it is necessary to use the \-D or \-\-duplicate option
-to display all duplicate entries for a job.
+original submit time it is necessary to use the \fB\-D\fR/\fB\-\-duplicates\fR
+option to display all duplicate entries for a job.
 .IP
 
 .TP
@@ -1175,8 +1183,8 @@ are handled.
 
 .TP
 \f3Timelimit\fP
-What the timelimit was/is for the job. Format is the same as \fBElapsed\fR,
-but two additional special values can be displayed:
+What the timelimit was/is for the job or job step. Format is the same as
+\fBElapsed\fR, but two additional special values can be displayed:
 .RS
 .TP
 \fBPartition_limit\fR
@@ -1192,8 +1200,8 @@ Indicates the job did not have a time limit defined.
 
 .TP
 \f3TimelimitRaw\fP
-What the timelimit was/is for the job. Format is in number of minutes.
-\fBNOTE\fR: See \fBTimeLimit\fR description.
+What the timelimit was/is for the job or job step. Format is in number of
+minutes. \fBNOTE\fR: See \fBTimeLimit\fR description.
 .IP
 
 .TP
@@ -1518,6 +1526,22 @@ variable takes precedence over the setting in the slurm.conf.
 .IP
 
 .TP
+\fBSLURM_JSON\fR
+Control JSON serialization:
+.IP
+.RS
+.TP
+\fBcompact\fR
+Output JSON as compact as possible.
+.IP
+
+.TP
+\fBpretty\fR
+Output JSON in pretty format to make it more readable.
+.IP
+.RE
+
+.TP
 \fBSLURM_TIME_FORMAT\fR
 Specify the format used to report time stamps. A value of \fIstandard\fR, the
 default value, generates output in the form "year\-month\-dateThour:minute:second".
@@ -1530,6 +1554,20 @@ For other years it returns a date month and year without a time (e.g.
 
 A valid strftime() format can also be specified. For example, a value of
 "%a %T" will report the day of the week and a time stamp (e.g. "Mon 12:34:56").
+.IP
+
+.TP
+\fBSLURM_YAML\fR
+Control YAML serialization:
+.IP
+.RS
+.TP
+\fBcompact\fR Output YAML as compact as possible.
+.IP
+
+.TP
+\fBpretty\fR Output YAML in pretty format to make it more readable.
+.RE
 .IP
 
 .SH "EXAMPLES"

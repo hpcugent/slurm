@@ -40,7 +40,6 @@
 
 #include <ctype.h>
 #include <inttypes.h>
-#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -563,6 +562,10 @@ static void _merge_system_gres_conf(list_t *gres_list_conf,
 					GRES_CONF_ENV_SET;
 			}
 
+			gres_slurmd_conf_sys->config_flags |=
+				gres_slurmd_conf->config_flags &
+				GRES_CONF_EXPLICIT;
+
 			list_remove(itr2);
 			list_append(gres_list_gpu, gres_slurmd_conf_sys);
 			continue;
@@ -775,13 +778,12 @@ extern int init(void)
 
 	return SLURM_SUCCESS;
 }
-extern int fini(void)
+
+extern void fini(void)
 {
 	debug("unloading");
 	gpu_plugin_fini();
 	FREE_NULL_LIST(gres_devices);
-
-	return SLURM_SUCCESS;
 }
 
 /*

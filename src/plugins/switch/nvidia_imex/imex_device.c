@@ -35,7 +35,6 @@
 
 #define _GNU_SOURCE
 
-#include <sched.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <sys/mount.h>
@@ -66,6 +65,7 @@ static int _find_major(void)
 				     "imex_dev_major="))) {
 		device_major = atoi(line);
 		info("using configured imex_dev_major: %d", device_major);
+		xfree(line);
 		return SLURM_SUCCESS;
 	}
 
@@ -104,6 +104,7 @@ static int _make_devdir(void)
 	mask = umask(0);
 	if ((mkdir(IMEX_DEV_DIR, 0755) < 0) && (errno != EEXIST)) {
 		error("could not create %s: %m", IMEX_DEV_DIR);
+		umask(mask);
 		return SLURM_ERROR;
 	}
 	umask(mask);
@@ -168,6 +169,9 @@ extern int setup_imex_channel(uint32_t channel, bool create_ns)
 	if (mknod(path, S_IFCHR | 0666, dev) < 0) {
 		error("%s: failed to create %s: %m", __func__, path);
 		rc = SLURM_ERROR;
+	} else {
+		log_flag(SWITCH, "Successfully setup IMEX channel ID %d at %s",
+			 channel, path);
 	}
 	umask(mask);
 	xfree(path);

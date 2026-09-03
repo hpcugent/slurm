@@ -107,14 +107,14 @@ int main(int argc, char **argv)
 		fatal("failed to initialize cli_filter plugin");
 
 	_set_exit_code();
-	if (spank_init_allocator() < 0) {
+	if (spank_init_allocator()) {
 		error("Failed to initialize plugin stack");
 		exit(error_exit);
 	}
 
 	/* Be sure to call spank_fini when sbatch exits
 	 */
-	if (atexit((void (*) (void)) spank_fini) < 0)
+	if (atexit((void (*) (void)) spank_fini))
 		error("Failed to register atexit handler for plugins: %m");
 
 	script_name = process_options_first_pass(argc, argv);
@@ -132,11 +132,20 @@ int main(int argc, char **argv)
 
 	if (sbopt.wrap != NULL) {
 		script_body = _script_wrap(sbopt.wrap);
+	} else if (opt.job_flags & EXTERNAL_JOB) {
+		script_body = NULL;
 	} else {
 		script_body = _get_script_buffer(script_name, &script_size);
+		if (!script_body)
+			exit(error_exit);
 	}
-	if (script_body == NULL)
-		exit(error_exit);
+
+	/*
+	 * Ensure this is not set in case this sbatch is nested in
+	 * another job where it is set. Removed here before environ is copied to
+	 * desc->environment in following loop.
+	 */
+	unsetenv("SLURM_STEPMGR");
 
 	het_job_argc = argc - opt.argc;
 	het_job_argv = argv;
@@ -175,12 +184,12 @@ int main(int argc, char **argv)
 			FREE_NULL_BUFFER(buf);
 		}
 
-		if (spank_init_post_opt() < 0) {
+		if (spank_init_post_opt()) {
 			error("Plugin stack post-option processing failed");
 			exit(error_exit);
 		}
 
-		if (opt.get_user_env_time < 0) {
+		if (!opt.get_user_env) {
 			/* Moab doesn't propagate the user's resource limits, so
 			 * slurmd determines the values at the same time that it
 			 * gets the user's default environment variables. */
@@ -326,17 +335,17 @@ int main(int argc, char **argv)
 
 	/* run cli_filter post_submit */
 	for (i = 0; i < het_job_limit; i++)
-		cli_filter_g_post_submit(i, resp->job_id, NO_VAL);
+		cli_filter_g_post_submit(i, resp->step_id.job_id, NO_VAL);
 
 	if (!quiet) {
 		if (!sbopt.parsable) {
-			printf("Submitted batch job %u", resp->job_id);
+			printf("Submitted batch job %u", resp->step_id.job_id);
 			if (working_cluster_rec)
 				printf(" on cluster %s",
 				       working_cluster_rec->name);
 			printf("\n");
 		} else {
-			printf("%u", resp->job_id);
+			printf("%u", resp->step_id.job_id);
 			if (working_cluster_rec)
 				printf(";%s", working_cluster_rec->name);
 			printf("\n");
@@ -344,7 +353,7 @@ int main(int argc, char **argv)
 	}
 
 	if (sbopt.wait)
-		rc = _job_wait(resp->job_id);
+		rc = _job_wait(resp->step_id.job_id);
 
 #ifdef MEMORY_LEAK_DEBUG
 	cli_filter_fini();
@@ -429,7 +438,14 @@ static int _fill_job_desc_from_opts(job_desc_msg_t *desc)
 
 	desc->wait_all_nodes = sbopt.wait_all_nodes;
 
+	if (sbopt.requeue != NO_VAL)
+		desc->requeue = sbopt.requeue;
+
 	desc->environment = NULL;
+
+	if (opt.job_flags & EXTERNAL_JOB)
+		return 0;
+
 	if (sbopt.export_file) {
 		desc->environment = env_array_from_file(sbopt.export_file);
 		if (desc->environment == NULL)
@@ -447,12 +463,12 @@ static int _fill_job_desc_from_opts(job_desc_msg_t *desc)
 		desc->environment = env_array_create();
 		env_array_merge_slurm_spank(&desc->environment,
 					    (const char **) environ);
-		opt.get_user_env_time = 0;
+		opt.get_user_env = true;
 	} else {
 		env_merge_filter(&opt, desc);
-		opt.get_user_env_time = 0;
+		opt.get_user_env = true;
 	}
-	if (opt.get_user_env_time >= 0) {
+	if (opt.get_user_env) {
 		env_array_overwrite(&desc->environment,
 				    "SLURM_GET_USER_ENV", "1");
 	}
@@ -470,9 +486,6 @@ static int _fill_job_desc_from_opts(job_desc_msg_t *desc)
 	desc->std_err  = xstrdup(opt.efname);
 	desc->std_in   = xstrdup(opt.ifname);
 	desc->std_out  = xstrdup(opt.ofname);
-
-	if (sbopt.requeue != NO_VAL)
-		desc->requeue = sbopt.requeue;
 
 	return 0;
 }

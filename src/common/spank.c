@@ -75,6 +75,7 @@ static bool has_task_exit = false;
 
 struct spank_plugin_operations {
 	spank_f *init;
+	int *init_failure_mode;
 	spank_f *job_prolog;
 	spank_f *init_post_opt;
 	spank_f *local_user_init;
@@ -88,9 +89,10 @@ struct spank_plugin_operations {
 	spank_f *exit;
 };
 
-const int n_spank_syms = 12;
+const int n_spank_syms = 13;
 const char *spank_syms[] = {
 	"slurm_spank_init",
+	"slurm_spank_init_failure_mode",
 	"slurm_spank_job_prolog",
 	"slurm_spank_init_post_opt",
 	"slurm_spank_local_user_init",
@@ -335,8 +337,11 @@ static struct spank_plugin *_spank_plugin_create(struct spank_stack *stack,
 	int e;
 	struct spank_plugin_operations ops;
 
-	if ((e = plugin_load_from_file(&p, path)) != SLURM_SUCCESS) {
-		error("spank: %s: %s", path, slurm_strerror(e));
+	if ((e = plugin_load_from_file(&p, path, required)) != SLURM_SUCCESS) {
+		if (required)
+			error("spank: %s: %s", path, slurm_strerror(e));
+		else
+			verbose("spank: %s: %s", path, slurm_strerror(e));
 		return NULL;
 	}
 
@@ -750,6 +755,8 @@ static int _do_call_stack(struct spank_stack *stack,
 		if (rc && sp->required) {
 			error("spank: required plugin %s: "
 			      "%s() failed with rc=%d", name, fn_name, rc);
+			if ((type == SPANK_INIT) && sp->ops.init_failure_mode)
+				rc = *(sp->ops.init_failure_mode);
 			break;
 		} else
 			rc = SLURM_SUCCESS;
@@ -816,8 +823,10 @@ static int spank_stack_post_opt (struct spank_stack * stack,
 
 static int spank_init_remote (stepd_step_rec_t *step)
 {
-	if (_spank_init (S_TYPE_REMOTE, step) < 0)
-		return (-1);
+	int rc = SLURM_SUCCESS;
+
+	if ((rc = _spank_init(S_TYPE_REMOTE, step)))
+		return rc;
 
 	/*
 	 * _spank_init initializes global_spank_stack
@@ -1145,7 +1154,7 @@ static int _do_option_cb(struct spank_plugin_opt *opt, const char *arg,
 	int rc = 0;
 
 	xassert(opt);
-	xassert(arg);
+	xassert(!opt->opt->has_arg || arg);
 
 	/*
 	 *  Call plugin callback if such a one exists
@@ -1743,11 +1752,11 @@ void spank_clear_remote_options_env (char **env)
 		if (xstrncmp (p, SPANK_OPTION_ENV_PREFIX, len) == 0) {
 			char *end = strchr (p+len, '=');
 			if (end) {
-				char name[1024];
-				memcpy (name, *ep, end - *ep);
-				name [end - *ep] = '\0';
+				char *name = xstrndup(*ep, end - *ep);
+
 				debug("unsetenv (%s)", name);
 				unsetenvp (env, name);
+				xfree(name);
 			}
 		}
 	}

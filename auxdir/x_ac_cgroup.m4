@@ -24,7 +24,7 @@ AC_DEFUN([X_AC_CGROUP],
     ])
 
   case ${host_os} in
-  darwin* | freebsd* | netbsd* )
+  darwin* | freebsd* | netbsd* | openbsd* )
     with_cgroup=no
     ;;
   *)
@@ -99,10 +99,45 @@ AC_DEFUN([X_AC_BPF], [
       else
         if test "x$x_ac_cgroupv2" = "xyes"; then
           AC_MSG_ERROR([unable to link against a bpf.h from kernel-headers, version >= 5.7 required for cgroup/v2])
-	else
+        else
           AC_MSG_WARN([unable to link against a bpf.h from kernel-headers, version >= 5.7 required for cgroup/v2])
-	fi
-	BPF_CPPFLAGS=""
+        fi
+        BPF_CPPFLAGS=""
+      fi
+
+      # Check for bpf token support
+      AC_LINK_IFELSE(
+	[AC_LANG_PROGRAM([[#include <linux/bpf.h>]],
+	  [[int def_test;
+	    def_test = BPF_TOKEN_CREATE;
+	    def_test = BPF_F_TOKEN_FD;]])],
+	  [ac_bpf_token_support=yes],
+	  [ac_bpf_token_support=no])
+      # Check which header provides the new mount API (FSCONFIG_*, FSMOUNT_*)
+      # needed for BPF token creation. glibc >= 2.36 provides these in
+      # <sys/mount.h>, older systems may have them in <linux/mount.h>.
+      if test "x$ac_bpf_token_support" = "xyes"; then
+        ac_mount_api_found=no
+        AC_CHECK_DECL([FSCONFIG_SET_STRING],
+          [AC_DEFINE([HAVE_MOUNT_API_SYS_MOUNT_H], [1],
+            [Define if sys/mount.h provides the mount API])
+           ac_mount_api_found=yes], [],
+          [[#include <sys/mount.h>]])
+        if test "x$ac_mount_api_found" = "xno"; then
+          AC_CHECK_DECL([FSCONFIG_SET_STRING],
+            [ac_mount_api_found=yes], [],
+            [[#include <linux/mount.h>]])
+        fi
+        if test "x$ac_mount_api_found" = "xno"; then
+          AC_MSG_WARN([Cannot find mount API (FSCONFIG_SET_STRING) in sys/mount.h or linux/mount.h. BPF token support will be disabled.])
+          ac_bpf_token_support=no
+        fi
+      fi
+
+      if test "x$ac_bpf_token_support" = "xyes"; then
+        AC_DEFINE([HAVE_BPF_TOKENS], [1], [Define if you are compiling with bpf tokens.])
+      else
+        AC_MSG_WARN([unable to build with BPF token support, BPF token support will be disabled. kernel-headers version >= 6.9 required to enable BPF token support .])
       fi
     fi
 
@@ -110,6 +145,7 @@ AC_DEFUN([X_AC_BPF], [
   fi
 
   AM_CONDITIONAL(WITH_BPF, test -n "$x_ac_cv_bpf_dir" && test "$ac_bpf_define_presence" = "yes")
+  AM_CONDITIONAL(WITH_BPF_TOKENS, test -n "$x_ac_cv_bpf_dir" && test "$ac_bpf_token_support" = "yes")
 ])
 
 AC_DEFUN([X_AC_DBUS],

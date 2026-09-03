@@ -40,6 +40,11 @@
 
 #include "../common/gpu_common.h"
 
+/* Added in NVML 11.1 (R455+, CUDA 11.1+) */
+#ifndef NVML_DEVICE_NAME_V2_BUFFER_SIZE
+#define NVML_DEVICE_NAME_V2_BUFFER_SIZE NVML_DEVICE_NAME_BUFFER_SIZE
+#endif
+
 #if defined (__APPLE__)
 extern slurmd_conf_t *conf __attribute__((weak_import));
 #else
@@ -110,7 +115,7 @@ static pid_t init_pid = 0;
 /*
  * Converts a cpu_set returned from the NVML API into a Slurm bitstr_t
  *
- * This function accounts for the endianess of the machine.
+ * This function accounts for the endianness of the machine.
  *
  * cpu_set_bitstr: (IN/OUT) A preallocated bitstr_t via bit_alloc() that is
  * 		   bitstr_size bits wide. This will get filled in.
@@ -1231,7 +1236,7 @@ static int _handle_mig(nvmlDevice_t *device, unsigned int gpu_minor,
 	nvmlDevice_t mig;
 	/* Use the V2 size so it can fit extra MIG info */
 	char mig_uuid[NVML_DEVICE_UUID_V2_BUFFER_SIZE] = {0};
-	char device_name[NVML_DEVICE_NAME_BUFFER_SIZE] = {0};
+	char device_name[NVML_DEVICE_NAME_V2_BUFFER_SIZE] = { 0 };
 	char *str;
 	unsigned int gi_id;
 	unsigned int ci_id;
@@ -1253,7 +1258,7 @@ static int _handle_mig(nvmlDevice_t *device, unsigned int gpu_minor,
 		return SLURM_ERROR;
 
 	_nvml_get_device_name(&mig, device_name,
-			      NVML_DEVICE_NAME_BUFFER_SIZE);
+			      NVML_DEVICE_NAME_V2_BUFFER_SIZE);
 	if (device_name[0] && (str = strstr(device_name, "mig_"))) {
 		/* Adding 3 to skip "mig" but keep "_" */
 		xstrfmtcat(nvml_mig->profile_name, "%s", str + 3);
@@ -1376,7 +1381,7 @@ static list_t *_get_system_gpu_list_nvml(node_config_load_t *node_config)
 		char *cpu_aff_mac_range = NULL;
 		char *device_file = NULL;
 		char *nvlinks = NULL;
-		char device_name[NVML_DEVICE_NAME_BUFFER_SIZE] = {0};
+		char device_name[NVML_DEVICE_NAME_V2_BUFFER_SIZE] = { 0 };
 		bool mig_mode = false, added_mig = false;
 		gres_slurmd_conf_t gres_slurmd_conf = {
 			.config_flags =
@@ -1398,7 +1403,7 @@ static list_t *_get_system_gpu_list_nvml(node_config_load_t *node_config)
 
 		memset(&pci_info, 0, sizeof(pci_info));
 		_nvml_get_device_name(&device, device_name,
-				      NVML_DEVICE_NAME_BUFFER_SIZE);
+				      NVML_DEVICE_NAME_V2_BUFFER_SIZE);
 		_nvml_get_device_uuid(&device, uuid,
 				      NVML_DEVICE_UUID_BUFFER_SIZE);
 		_nvml_get_device_pci_info(&device, &pci_info);
@@ -1489,6 +1494,8 @@ static list_t *_get_system_gpu_list_nvml(node_config_load_t *node_config)
 			if (mig_count == 0)
 				error("MIG mode is enabled, but no MIG devices were found. Please either create MIG instances, disable MIG mode, remove AutoDetect=nvml, or remove GPUs from the configuration completely.");
 
+			gres_slurmd_conf.config_flags |= GRES_CONF_MIG;
+
 			for (unsigned int j = 0; j < mig_count; j++) {
 				nvml_mig_t nvml_mig = { 0 };
 				nvml_mig.files = xstrdup(device_file);
@@ -1528,6 +1535,7 @@ static list_t *_get_system_gpu_list_nvml(node_config_load_t *node_config)
 			gres_slurmd_conf.file = device_file;
 			gres_slurmd_conf.links = nvlinks;
 			gres_slurmd_conf.type_name = device_name;
+			gres_slurmd_conf.unique_id = uuid;
 
 			add_gres_to_list(gres_list_system, &gres_slurmd_conf);
 		}
@@ -1701,13 +1709,11 @@ extern int init(void)
 	return SLURM_SUCCESS;
 }
 
-extern int fini(void)
+extern void fini(void)
 {
 	_nvml_shutdown();
 
 	debug("%s: unloading %s", __func__, plugin_name);
-
-	return SLURM_SUCCESS;
 }
 
 extern list_t *gpu_p_get_system_gpu_list(node_config_load_t *node_config)

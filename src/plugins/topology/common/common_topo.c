@@ -75,8 +75,21 @@ typedef struct {
 	uint16_t tree_width;
 } _foreach_part_split_hostlist_t;
 
-static int _split_hostlist_treewidth(hostlist_t *hl, hostlist_t ***sp_hl,
-				     int *count, uint16_t tree_width);
+typedef struct {
+	avail_res_t *avail_res;
+	int node_inx;
+} _sort_choose_nodes_t;
+
+static int _cmp_res(const void *x, const void *y)
+{
+	const _sort_choose_nodes_t *r1 = x, *r2 = y;
+
+	if (r1->avail_res->avail_res_prod > r2->avail_res->avail_res_prod)
+		return 1;
+	else if (r1->avail_res->avail_res_prod < r2->avail_res->avail_res_prod)
+		return -1;
+	return 0;
+}
 
 static int _part_split_hostlist(void *x, void *y)
 {
@@ -98,8 +111,8 @@ static int _part_split_hostlist(void *x, void *y)
 	hl = bitmap2hostlist(arg->fwd_bitmap);
 
 	/* Generate FW tree hostlist array from partition's hostlist */
-	hl_depth = _split_hostlist_treewidth(hl, &p_hl, &hl_count,
-					     arg->tree_width);
+	hl_depth = hostlist_split_treewidth(hl, &p_hl, &hl_count,
+					    arg->tree_width);
 	hostlist_destroy(hl);
 
 	/* Make size for FW tree hostlist array in the main hostlist array */
@@ -124,7 +137,8 @@ static int _route_part_split_hostlist(hostlist_t *hl, hostlist_t ***sp_hl,
 				      int *count, uint16_t tree_width)
 {
 	slurmctld_lock_t node_read_lock = {
-		.node = READ_LOCK, .part = READ_LOCK
+		.node = READ_LOCK,
+		.part = READ_LOCK,
 	};
 	bitstr_t *nodes_bitmap = NULL;
 	_foreach_part_split_hostlist_t part_split;
@@ -199,142 +213,6 @@ static int _route_part_split_hostlist(hostlist_t *hl, hostlist_t ***sp_hl,
 	return part_split.depth;
 }
 
-/* this is used to set how many nodes are going to be on each branch
- * of the tree.
- * IN total       - total number of nodes to send to
- * IN tree_width  - how wide the tree should be on each hop
- * OUT span       - pointer to int array tree_width in length each space
- *		    containing the number of nodes to send to each hop
- *		    on the span.
- * RET int	  - the number of levels opened in the tree, or SLURM_ERROR
- */
-static int _set_span(int total, uint16_t tree_width, int **span)
-{
-	int depth = 0;
-
-	/* This should not happen. This is an error. */
-	if (!span || total < 1)
-		return SLURM_ERROR;
-
-	/* If default span */
-	if (!tree_width)
-		tree_width = slurm_conf.tree_width;
-
-	/* Safeguard from leaks */
-	if (*span)
-		xfree(*span);
-
-	/*
-	 * Memory optimization:
-	 * Don't allocate if we are in the last step to the leaves, as this is
-	 * considered direct communication and we don't really need it.
-	 */
-	if (total <= tree_width)
-		return 1;
-
-	/* Each cell will contain the #nodes below this specific branch */
-	*span = xcalloc(tree_width, sizeof(int));
-
-	/*
-	 * Try to fill levels until no more nodes are available.
-	 *
-	 * Each time a new level is created, it is exponentially bigger than the
-	 * previous one
-	 */
-	for (int branch_capacity = 1, level_capacity = tree_width; total;
-	     branch_capacity *= tree_width, level_capacity *= tree_width) {
-		/* Remaining nodes can fill a whole new level up, or not */
-		if (level_capacity <= total) {
-			for (int i = 0; i < tree_width; i++)
-				(*span)[i] += branch_capacity;
-			total -= level_capacity;
-		} else {
-			/* Evenly distribute remaining nodes */
-			branch_capacity = total / tree_width;
-			/* But left the division remainder ones */
-			level_capacity = branch_capacity * tree_width;
-			/* Fill current level up, as much as possible */
-			for (int i = 0; i < tree_width; i++)
-				(*span)[i] += branch_capacity;
-			total -= level_capacity;
-
-			/* Evenly distribute the remainder nodes */
-			for (int i = 0; total; i++, total--)
-				(*span)[i]++;
-
-			/* total == 0 always at this point */
-		}
-
-		/* One level more has been added */
-		depth++;
-
-		/* The level needed all the nodes, no more levels are added */
-		if (!total)
-			break;
-	}
-
-	/* Inform the caller about the number of levels below itself */
-	return depth;
-}
-
-static int _split_hostlist_treewidth(hostlist_t *hl, hostlist_t ***sp_hl,
-				     int *count, uint16_t tree_width)
-{
-	int host_count = hostlist_count(hl), depth, *span = NULL;
-	char *name;
-
-	/* If default span */
-	if (!tree_width)
-		tree_width = slurm_conf.tree_width;
-
-	/* This should not happen. This is an error. */
-	if ((depth = _set_span(host_count, tree_width, &span)) < 0)
-		return SLURM_ERROR;
-
-	/*
-	 * Memory optimization:
-	 * _set_span doesn't return array for direct communication
-	 * (if depth == 1 then span == NULL), so we just fill the hostlist array
-	 * directly.
-	 */
-	if (depth == 1)
-		tree_width = host_count;
-
-	/* Each cell will contain the hostlist below this specific branch */
-	*sp_hl = xcalloc(tree_width, sizeof(hostlist_t *));
-
-	/*
-	 * Fill the hostlists for each branch according to the distribution in
-	 * set_span.
-	 *
-	 * Additionally, try to preserve network locality (based on distance)
-	 * for subtrees, by assuming consecutive nodes are placed one next to
-	 * each other
-	 */
-	for (*count = 0; (*count < tree_width) && (name = hostlist_shift(hl));
-	     (*count)++) {
-		/* Open the new branch, and add the 1st one */
-		(*sp_hl)[*count] = hostlist_create(name);
-		free(name);
-
-		/* Consecutively add the rest of nodes for this branch */
-		for (int i = 1; span && (i < span[*count]); i++) {
-			name = hostlist_shift(hl);
-			hostlist_push_host((*sp_hl)[*count], name);
-			free(name);
-		}
-		if (slurm_conf.debug_flags & DEBUG_FLAG_ROUTE) {
-			char *buf =
-			hostlist_ranged_string_xmalloc((*sp_hl)[*count]);
-			debug("ROUTE: ... sublist[%d] %s", *count, buf);
-			xfree(buf);
-		}
-	}
-
-	xfree(span);
-	return depth;
-}
-
 extern int common_topo_split_hostlist_treewidth(hostlist_t *hl,
 						hostlist_t ***sp_hl,
 						int *count, uint16_t tree_width)
@@ -342,17 +220,14 @@ extern int common_topo_split_hostlist_treewidth(hostlist_t *hl,
 	if (running_in_slurmctld() && common_topo_route_part())
 		return _route_part_split_hostlist(hl, sp_hl, count, tree_width);
 
-	return _split_hostlist_treewidth(hl, sp_hl, count, tree_width);
+	return hostlist_split_treewidth(hl, sp_hl, count, tree_width);
 }
 
 extern int common_topo_get_node_addr(char *node_name, char **addr,
 				     char **pattern)
 {
-
-#ifndef HAVE_FRONT_END
 	if (find_node_record(node_name) == NULL)
 		return SLURM_ERROR;
-#endif
 
 	*addr = xstrdup(node_name);
 	*pattern = xstrdup("node");
@@ -390,17 +265,20 @@ extern int common_topo_choose_nodes(topology_eval_t *topo_eval)
 	avail_res_t **avail_res_array = topo_eval->avail_res_array;
 	job_record_t *job_ptr = topo_eval->job_ptr;
 
-	int i, count, ec, most_res = 0;
+	int ec;
 	bitstr_t *orig_node_map, *req_node_map = NULL;
 	bitstr_t **orig_core_array;
 	int rem_nodes;
 	uint32_t orig_max_nodes = topo_eval->max_nodes;
+	_sort_choose_nodes_t *sorted_res = NULL;
+	int res_cnt = 0, idx = -1;
+	bool need_bit_test = false;
 
 	if (job_ptr->details->req_node_bitmap)
 		req_node_map = job_ptr->details->req_node_bitmap;
 
 	/* clear nodes from the bitmap that don't have available resources */
-	for (i = 0; next_node_bitmap(topo_eval->node_map, &i); i++) {
+	for (int i = 0; next_node_bitmap(topo_eval->node_map, &i); i++) {
 		/*
 		 * Make sure we don't say we can use a node exclusively
 		 * that is bigger than our whole-job maximum CPU count.
@@ -408,10 +286,10 @@ extern int common_topo_choose_nodes(topology_eval_t *topo_eval)
 		if (((job_ptr->details->whole_node & WHOLE_NODE_REQUIRED) &&
 		     (job_ptr->details->max_cpus != NO_VAL) &&
 		     (job_ptr->details->max_cpus <
-		      avail_res_array[i]->avail_cpus)) ||
-		/* OR node has no CPUs */
-		    (avail_res_array[i]->avail_cpus < 1)) {
 
+		      avail_res_array[i]->avail_cpus)) ||
+		    /* OR node has no CPUs */
+		    (avail_res_array[i]->avail_cpus < 1)) {
 			if (req_node_map && bit_test(req_node_map, i)) {
 				/* can't clear a required node! */
 				return SLURM_ERROR;
@@ -436,71 +314,107 @@ extern int common_topo_choose_nodes(topology_eval_t *topo_eval)
 	topo_eval->first_pass = true;
 
 	ec = eval_nodes(topo_eval);
-	if (ec == SLURM_SUCCESS)
+	/*
+	 * Already succeeded or permanent error
+	 */
+	if ((ec == SLURM_SUCCESS) ||
+	    (ec == ESLURM_REQUESTED_TOPO_CONFIG_UNAVAILABLE))
 		goto fini;
-
-	topo_eval->first_pass = false;
-	topo_eval->max_nodes = orig_max_nodes;
-
-	bit_or(topo_eval->node_map, orig_node_map);
-	core_array_or(topo_eval->avail_core, orig_core_array);
-
-	rem_nodes = bit_set_count(topo_eval->node_map);
-	if (rem_nodes <= topo_eval->min_nodes) {
-		/* Can not remove any nodes, enable use of non-local GRES */
-		ec = eval_nodes(topo_eval);
-		goto fini;
-	}
 
 	/*
 	 * This nodeset didn't work. To avoid a possible knapsack problem,
-	 * incrementally remove nodes with low resource counts (sum of CPU and
+	 * incrementally remove nodes with low resource (product of CPU and
 	 * GPU count if using GPUs, otherwise the CPU count) and retry
 	 */
-	for (i = 0; next_node(&i); i++) {
-		if (avail_res_array[i]) {
-			most_res = MAX(most_res,
-				       avail_res_array[i]->avail_res_cnt);
-		}
-	}
+	topo_eval->first_pass = false;
+	rem_nodes = bit_set_count(orig_node_map);
 
-	for (count = 1; count < most_res; count++) {
-		int nochange = 1;
+	/*
+	 * Perform first eval_nodes() with first_pass = false and then start
+	 * removing nodes.
+	 */
+	do {
 		topo_eval->max_nodes = orig_max_nodes;
-		bit_or(topo_eval->node_map, orig_node_map);
+		bit_copybits(topo_eval->node_map, orig_node_map);
 		core_array_or(topo_eval->avail_core, orig_core_array);
-		for (i = 0; next_node_bitmap(topo_eval->node_map, &i); i++) {
-			if ((avail_res_array[i]->avail_res_cnt > 0) &&
-			    (avail_res_array[i]->avail_res_cnt <= count)) {
-				if (req_node_map && bit_test(req_node_map, i))
-					continue;
-				/*
-				 * We adjust avail_res_cnt to the minimum needed
-				 * for the evaluated nodes on every
-				 * eval_nodes().
-				 * So, we need to check again if some more nodes
-				 * can be removed in the updated nodeset before
-				 * increasing the count, or we could end up
-				 * removing more (possibly valid) nodes than
-				 * needed.
-				 */
-				if (nochange)
-					count--;
-				nochange = 0;
-				bit_clear(topo_eval->node_map, i);
-				bit_clear(orig_node_map, i);
-				if (--rem_nodes <= topo_eval->min_nodes)
-					break;
-			}
-		}
-		if (nochange && (count != 1))
-			continue;
+
 		ec = eval_nodes(topo_eval);
+
 		if (ec == SLURM_SUCCESS)
 			break;
+
+		if (ec == ESLURM_BREAK_EVAL)
+			break;
+
 		if (rem_nodes <= topo_eval->min_nodes)
 			break;
-	}
+
+		if (ec == ESLURM_RETRY_EVAL) {
+			bit_and_not(orig_node_map, topo_eval->node_map);
+			rem_nodes = bit_set_count(orig_node_map);
+
+			if (sorted_res)
+				need_bit_test = true;
+
+			continue;
+		}
+
+		if (!sorted_res) {
+			sorted_res = xcalloc(rem_nodes, sizeof(*sorted_res));
+			for (int i = 0; next_node_bitmap(orig_node_map, &i);
+			     i++) {
+				if (avail_res_array[i] &&
+				    !(req_node_map &&
+				      bit_test(req_node_map, i))) {
+					sorted_res[res_cnt].node_inx = i;
+					sorted_res[res_cnt].avail_res =
+						avail_res_array[i];
+					res_cnt++;
+				}
+			}
+
+			if (!res_cnt)
+				break;
+
+			qsort(sorted_res, res_cnt, sizeof(*sorted_res),
+			      _cmp_res);
+			idx = 0;
+		}
+
+		if (ec == ESLURM_RETRY_EVAL_HINT &&
+		    (bit_ffs(topo_eval->node_map) >= 0)) {
+			int tmp_idx = idx;
+
+			while ((tmp_idx < res_cnt) &&
+			       !bit_test(topo_eval->node_map,
+					 sorted_res[tmp_idx].node_inx)) {
+				tmp_idx++;
+			}
+			if (tmp_idx == res_cnt)
+				break;
+			bit_clear(orig_node_map, sorted_res[tmp_idx].node_inx);
+			--rem_nodes;
+
+			if (tmp_idx == idx)
+				idx++;
+			else
+				need_bit_test = true;
+
+			continue;
+		}
+
+		while (need_bit_test && (idx < res_cnt) &&
+		       !bit_test(orig_node_map, sorted_res[idx].node_inx)) {
+			idx++;
+		}
+
+		if (idx == res_cnt)
+			break;
+
+		bit_clear(orig_node_map, sorted_res[idx].node_inx);
+		--rem_nodes;
+		idx++;
+	} while (idx < res_cnt);
 
 fini:	if ((ec == SLURM_SUCCESS) && job_ptr->gres_list_req &&
 	     orig_core_array) {
@@ -508,7 +422,9 @@ fini:	if ((ec == SLURM_SUCCESS) && job_ptr->gres_list_req &&
 		 * Update available CPU count for any removed cores.
 		 * Cores are only removed for jobs with GRES to enforce binding.
 		 */
-		for (i = 0; next_node_bitmap(topo_eval->node_map, &i); i++) {
+		for (int i = 0; next_node_bitmap(topo_eval->node_map, &i);
+		     i++) {
+			int count;
 			if (!orig_core_array[i] || !topo_eval->avail_core[i])
 				continue;
 			count = bit_set_count(topo_eval->avail_core[i]);
@@ -528,5 +444,6 @@ fini:	if ((ec == SLURM_SUCCESS) && job_ptr->gres_list_req &&
 	}
 	FREE_NULL_BITMAP(orig_node_map);
 	free_core_array(&orig_core_array);
+	xfree(sorted_res);
 	return ec;
 }

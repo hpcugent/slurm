@@ -116,6 +116,10 @@ scheduling. It is only compatible with <I>PreemptType=preempt/none</I>.
 <I>GANG</I>: Enables gang scheduling (time slicing) of jobs in the same
 partition, and allows the resuming of suspended jobs. In order to use gang
 scheduling, the <b>GANG</b> option must be specified at the cluster level.
+<BR><B>NOTE</B>: If <b>GANG</b> scheduling is enabled with
+<I>PreemptType=preempt/partition_prio</I>, the controller will ignore
+<I>PreemptExemptTime</I> and the following <I>PreemptParameters</I>:
+<I>reorder_count</I>, <I>strict_order</I>, and <I>youngest_first</I>.
 <BR>
 <B>NOTE</B>: Gang scheduling is performed independently for each partition, so
 if you only want time-slicing by <I>OverSubscribe</I>, without any preemption,
@@ -149,6 +153,16 @@ the preemptor job from are on the same partition, then they will share
 resources with the Gang scheduler (time-slicing). If not (i.e. if the
 preemptees and preemptor are on different partitions) then the preempted jobs
 will remain suspended until the preemptor ends.
+</LI>
+<LI>
+<I>PRIORITY</I>: Allow preemption only if the preemptor's job priority is higher
+than the preemptee's job priority.
+</LI>
+<LI>
+<I>WITHIN</I>: For <I>PreemptType=preempt/qos</I>, allow jobs within the same
+qos to preempt one another. While this can be set globally, it is recommend
+that this only be set directly on a relevant subset of the system qos values
+instead.
 </LI>
 </UL>
 </LI>
@@ -551,7 +565,5 @@ algorithm would have to include factors such as job size and required nodes in
 order to support ideal placements such as this, which can quickly complicate
 the design. Any and all help is welcome here!
 </P>
-
-<p style="text-align:center;">Last modified 21 May 2024</p>
 
 <!--#include virtual="footer.txt"-->

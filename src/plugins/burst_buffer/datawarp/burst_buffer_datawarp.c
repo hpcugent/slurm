@@ -803,13 +803,12 @@ static void _save_bb_state(void)
  * and QOS information for persistent burst buffers. */
 static void _recover_bb_state(void)
 {
-	char *state_file = NULL, *data = NULL;
-	int data_allocated, data_read = 0;
+	char *state_file = NULL;
 	uint16_t protocol_version = NO_VAL16;
-	uint32_t data_size = 0, rec_count = 0;
+	uint32_t rec_count = 0;
 	uint32_t id = 0, user_id = 0;
 	uint64_t size = 0;
-	int i, state_fd;
+	int i;
 	char *account = NULL, *name = NULL;
 	char *partition = NULL, *pool = NULL, *qos = NULL;
 	char *end_ptr = NULL;
@@ -817,34 +816,16 @@ static void _recover_bb_state(void)
 	bb_alloc_t *bb_alloc;
 	buf_t *buffer;
 
-	state_fd = bb_open_state_file("burst_buffer_cray_state", &state_file);
-	if (state_fd < 0) {
+	errno = 0;
+	buffer = state_save_open("burst_buffer_cray_state", &state_file);
+	if (!buffer && (errno == ENOENT)) {
 		info("No burst buffer state file (%s) to recover",
 		     state_file);
 		xfree(state_file);
 		return;
 	}
-	data_allocated = BUF_SIZE;
-	data = xmalloc(data_allocated);
-	while (1) {
-		data_read = read(state_fd, &data[data_size], BUF_SIZE);
-		if (data_read < 0) {
-			if  (errno == EINTR)
-				continue;
-			else {
-				error("Read error on %s: %m", state_file);
-				break;
-			}
-		} else if (data_read == 0)     /* eof */
-			break;
-		data_size      += data_read;
-		data_allocated += data_read;
-		xrealloc(data, data_allocated);
-	}
-	close(state_fd);
 	xfree(state_file);
 
-	buffer = create_buf(data, data_size);
 	safe_unpack16(&protocol_version, buffer);
 	if (protocol_version == NO_VAL16) {
 		if (!ignore_state_errors)
@@ -2512,9 +2493,8 @@ fini:	xfree(access);
 }
 
 /*
- * init() is called when the plugin is loaded, before any other functions
- * are called.  Read and validate configuration file here. Spawn thread to
- * periodically read Datawarp state.
+ * Read and validate configuration file.
+ * Spawn thread to periodically read Datawarp state.
  */
 extern int init(void)
 {
@@ -2531,11 +2511,7 @@ extern int init(void)
 	return SLURM_SUCCESS;
 }
 
-/*
- * fini() is called when the plugin is unloaded. Free all memory and shutdown
- * threads.
- */
-extern int fini(void)
+extern void fini(void)
 {
 	int pc, last_pc = 0;
 
@@ -2564,8 +2540,6 @@ extern int fini(void)
 	bb_clear_config(&bb_state.bb_config, true);
 	bb_clear_cache(&bb_state);
 	slurm_mutex_unlock(&bb_state.bb_mutex);
-
-	return SLURM_SUCCESS;
 }
 
 static void _pre_queue_stage_out(job_record_t *job_ptr, bb_job_t *bb_job)

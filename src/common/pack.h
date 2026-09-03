@@ -80,6 +80,16 @@ typedef struct {
 #define remaining_buf(__buf)		(__buf->size - __buf->processed)
 #define size_buf(__buf)			(__buf->size)
 
+/* Initialize shadow buffer to point at data with size of bytes */
+#define SHADOW_BUF_INITIALIZER(data, bytes) \
+	(buf_t) { \
+		.magic = BUF_MAGIC, \
+		.head = (char *) (data), \
+		.size = (bytes), \
+		.processed = (bytes), \
+		.shadow = true, \
+	}
+
 typedef struct {
 	buf_t *header;
 	buf_t *auth;
@@ -115,13 +125,6 @@ extern int try_grow_buf(buf_t *buffer, uint32_t size);
  */
 extern int try_grow_buf_remaining(buf_t *buffer, uint32_t size);
 extern void *xfer_buf_data(buf_t *my_buf);
-/*
- * Swap data between two buffers
- * IN x - pointer to buffer to swap
- * IN y - pointer to buffer to swap
- * RET SLURM_SUCCESS or error
- */
-extern int swap_buf_data(buf_t *x, buf_t *y);
 
 extern void pack_time(time_t val, buf_t *buffer);
 extern int unpack_time(time_t *valp, buf_t *buffer);

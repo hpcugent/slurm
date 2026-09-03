@@ -47,12 +47,17 @@
 #include "src/common/assoc_mgr.h"
 #include "src/common/log.h"
 #include "src/common/parse_time.h"
+#include "src/common/slurm_protocol_defs.h"
 #include "src/common/xstring.h"
 #include "src/lua/slurm_lua.h"
 
 static void *lua_handle = NULL;
 
 #ifdef HAVE_LUA
+
+#if LUA_VERSION_NUM >= 502
+#define LUA_ERROR_BACKTRACE
+#endif
 
 /*
  * These are defined here so when we link with something other than the
@@ -65,6 +70,188 @@ extern void *acct_db_conn  __attribute__((weak_import));
 #else
 uint16_t accounting_enforce = 0;
 void *acct_db_conn = NULL;
+#endif
+
+#define LUA_ERROR_HANDLER_FUNC "slurm_backtrace_on_error"
+
+#define T(status_code, string, err) { status_code, #status_code, string, err }
+
+static const struct {
+	lua_status_code_t status_code;
+	const char *status_code_string;
+	const char *string;
+	slurm_err_t err;
+} lua_status_codes[] = {
+	/*
+	 * Status codes macros from lua.h and messages derived from:
+	 *	https://www.lua.org/manual/5.3/manual.html
+	 */
+	T(LUA_OK, "SUCCESS", SLURM_SUCCESS),
+	T(LUA_YIELD, "Thread yielded", ESLURM_LUA_FUNC_FAILED),
+	T(LUA_ERRRUN, "Runtime error", ESLURM_LUA_FUNC_FAILED_RUNTIME_ERROR),
+	T(LUA_ERRSYNTAX, "Syntax error during precompilation",
+	  ESLURM_LUA_INVALID_SYNTAX),
+	T(LUA_ERRMEM, "Memory allocation error", ESLURM_LUA_FUNC_FAILED_ENOMEM),
+#ifdef LUA_ERRGCMM
+	T(LUA_ERRGCMM, "Error while running a __gc metamethod",
+	  ESLURM_LUA_FUNC_FAILED_GARBAGE_COLLECTOR),
+#endif
+	T(LUA_ERRERR, "Error while running the message handler",
+	  ESLURM_LUA_FUNC_FAILED_RUNTIME_ERROR),
+};
+#undef T
+
+extern const char *slurm_lua_status_code_string(lua_status_code_t sc)
+{
+	for (int i = 0; i < ARRAY_SIZE(lua_status_codes); i++)
+		if (lua_status_codes[i].status_code == sc)
+			return lua_status_codes[i].string;
+
+	/*
+	 * Should never happen but only Lua controls returns these values so it
+	 * is out of Slurm's control.
+	 */
+	return "Unknown Lua status code";
+}
+
+extern const char *slurm_lua_status_code_stringify(lua_status_code_t sc)
+{
+	for (int i = 0; i < ARRAY_SIZE(lua_status_codes); i++)
+		if (lua_status_codes[i].status_code == sc)
+			return lua_status_codes[i].status_code_string;
+
+	return "INVALID";
+}
+
+extern slurm_err_t slurm_lua_status_error(lua_status_code_t sc)
+{
+	for (int i = 0; i < ARRAY_SIZE(lua_status_codes); i++)
+		if (lua_status_codes[i].status_code == sc)
+			return lua_status_codes[i].err;
+
+	return ESLURM_LUA_FUNC_FAILED;
+}
+
+#ifdef LUA_ERROR_BACKTRACE
+
+/*
+ * Error callback handler function.
+ * Partially based on msghandler() from lua.c (from the lua binary).
+ */
+static int _on_error_callback(lua_State *L)
+{
+	const char *msg = NULL;
+
+	/*
+	 * Only log the backtrace when running at least under DEBUG_FLAG_SCRIPT
+	 * as this is not a free operation and may end up logging excessively.
+	 */
+	if (!(slurm_conf.debug_flags & DEBUG_FLAG_SCRIPT))
+		return 1;
+
+	/* Lua should have already have already placed error string on stack */
+	if (!(msg = lua_tostring(L, -1))) {
+		/*
+		 * Request Lua convert error to string if lua_tostring() failed
+		 * for any reason or gracefully fail while getting the type of
+		 * what was unexpectedly pushed on the stack
+		 */
+		if (luaL_callmeta(L, -1, "__tostring") &&
+		    lua_type(L, -1) == LUA_TSTRING)
+			msg = lua_tostring(L, -1);
+		else
+			msg = lua_pushfstring(L, "Unknown error of type %s",
+					      luaL_typename(L, -1));
+	}
+
+	/* msg should always have a string at this point */
+	xassert(msg && msg[0]);
+
+	log_flag(SCRIPT, "%s: Lua@0x%"PRIxPTR" failed: %s",
+		 __func__, (uintptr_t) L, msg);
+
+	/* Request Lua generate backtrace */
+	luaL_traceback(L, L, NULL, 1);
+
+	if ((msg = lua_tostring(L, -1))) {
+		char *save_ptr = NULL, *token = NULL, *str = NULL;
+		int count = 0, line = 0;
+
+		xassert(msg && msg[0]);
+
+		/* count number of lines */
+		for (const char *ptr = msg; ptr && *ptr; count++)
+			if ((ptr = strstr(ptr, "\n")))
+				ptr++;
+
+		/*
+		 * Split up the backtrace by each newline to keep the logs
+		 * readable
+		 */
+		str = xstrdup(msg);
+		token = strtok_r(str, "\n", &save_ptr);
+		while (token) {
+			token = strtok_r(NULL, "\n", &save_ptr);
+			line++;
+
+			log_flag(SCRIPT, "%s: Lua@0x%"PRIxPTR" backtrace[%04d/%04d]: %s",
+				 __func__, (uintptr_t) L, line, count, token);
+		}
+		xfree(str);
+	}
+
+	/*
+	 * Pop backtrace off stack to preserve returning original error message
+	 * for existing logging
+	 */
+	lua_pop(L, -1);
+
+	/* returning original error message */
+	return 1;
+}
+
+/*
+ * Push error callback before pcall args
+ * IN L - Lua state
+ * RET index for function (aka msgh)
+ */
+static int _push_error_callback(lua_State *L)
+{
+	const int index = 1;
+
+	/*
+	 * Always place error handler function at the very bottom of the stack
+	 * to avoid it getting moved around by any of the arg or return stack
+	 * shifting
+	 *
+	 * The error handler doesn't work when registered via slurm_functions[]
+	 * due to the requirement to be placed directly on the stack.
+	 */
+
+	lua_getglobal(L, LUA_ERROR_HANDLER_FUNC);
+
+	/* There must be something on the stack here */
+	xassert(lua_gettop(L) > 0);
+
+	lua_insert(L, index);
+
+	return index;
+}
+
+/*
+ * Register error handler callback into Lua globals
+ * IN L - Lua stack
+ */
+static void _register_error_callback(lua_State *L)
+{
+	lua_register(L, LUA_ERROR_HANDLER_FUNC, _on_error_callback);
+}
+
+#else
+
+#define _push_error_callback(L) 0
+#define _register_error_callback(L) ((void) 0)
+
 #endif
 
 static int _setup_stringarray(lua_State *L, int limit, char **data)
@@ -83,17 +270,65 @@ static int _setup_stringarray(lua_State *L, int limit, char **data)
 	return 1;
 }
 
-/*
- *  check that global symbol [name] in lua script is a function
- */
-static int _check_lua_script_function(lua_State *L, const char *name)
+extern int slurm_lua_pcall(lua_State *L, int nargs, int nresults,
+			   char **err_ptr, const char *caller)
 {
-	int rc = 0;
+	lua_status_code_t sc;
+	int rc;
+	int msgh = 0;
+
+	if (slurm_conf.debug_flags & DEBUG_FLAG_SCRIPT) {
+		/* Resolve out the error handler if it was already pushed */
+		msgh = _push_error_callback(L);
+	}
+
+	sc = lua_pcall(L, nargs, nresults, msgh);
+	rc = slurm_lua_status_error(sc);
+
+	if (rc) {
+		/*
+		 * When a lua_pcall() fails, Lua "pushes a single value on the
+		 * stack (the error object)" per lua_pcall() description in the
+		 * reference manual:
+		 *	https://www.lua.org/manual/5.3/manual.html
+		 * When msgh == 0, this is the same as the return value of
+		 * lua_pcall().
+		 *
+		 * This function will lua_pop() that value to remove it from
+		 * the stack.
+		 */
+		if (!(*err_ptr = xstrdup(lua_tostring(L, -1))))
+			*err_ptr = xstrdup(slurm_strerror(rc));
+
+		lua_pop(L, 1);
+
+		error("%s: lua_pcall(0x%"PRIxPTR", %d, %d, %d)=%s(%s)=%s",
+		      caller, (uintptr_t) L, nargs, nresults, msgh,
+		      slurm_lua_status_code_stringify(sc),
+		      slurm_lua_status_code_string(sc), *err_ptr);
+	} else {
+		log_flag(SCRIPT, "%s: lua_pcall(0x%"PRIxPTR", %d, %d, %d)=%s(%s)=%s",
+		      caller, (uintptr_t) L, nargs, nresults, msgh,
+		      slurm_lua_status_code_stringify(sc),
+		      slurm_lua_status_code_string(sc), slurm_strerror(rc));
+	}
+
+	/* Pop error handler off stack if pushed */
+	if (msgh)
+		lua_remove(L, msgh);
+
+	return rc;
+}
+
+extern bool slurm_lua_is_function_defined(lua_State *L, const char *name)
+{
+	bool rc = false;
+
 	lua_getglobal(L, name);
-	if (!lua_isfunction(L, -1))
-		rc = -1;
+	rc = lua_isfunction(L, -1);
 	lua_pop(L, -1);
-	return (rc);
+
+	return rc;
 }
 
 /*
@@ -106,7 +341,7 @@ static int _check_lua_script_functions(lua_State *L, const char *plugin,
 	int rc = 0;
 	const char **ptr = NULL;
 	for (ptr = req_fxns; ptr && *ptr; ptr++) {
-		if (_check_lua_script_function(L, *ptr) < 0) {
+		if (!slurm_lua_is_function_defined(L, *ptr)) {
 			error("%s: %s: missing required function %s",
 			      plugin, script_path, *ptr);
 			rc = -1;
@@ -259,6 +494,10 @@ static void _register_slurm_output_functions(lua_State *L)
 		 unpack_str);
 	luaL_loadstring(L, tmp_string);
 	lua_setfield(L, -2, "log_debug4");
+	snprintf(tmp_string, sizeof(tmp_string),
+		 "slurm.user_msg (string.format(%s({...})))", unpack_str);
+	luaL_loadstring(L, tmp_string);
+	lua_setfield(L, -2, "log_user");
 
 	/*
 	 * Error codes: slurm.SUCCESS, slurm.FAILURE, slurm.ERROR, etc.
@@ -349,6 +588,12 @@ static void _register_slurm_output_functions(lua_State *L)
 	lua_setfield(L, -2, "USE_MIN_NODES");
 	lua_pushnumber(L, STEPMGR_ENABLED);
 	lua_setfield(L, -2, "STEPMGR_ENABLED");
+	lua_pushnumber(L, SPREAD_SEGMENTS);
+	lua_setfield(L, -2, "SPREAD_SEGMENTS");
+	lua_pushnumber(L, CONSOLIDATE_SEGMENTS);
+	lua_setfield(L, -2, "CONSOLIDATE_SEGMENTS");
+	lua_pushnumber(L, EXPEDITED_REQUEUE);
+	lua_setfield(L, -2, "EXPEDITED_REQUEUE");
 
 	lua_pushstring(L, slurm_conf.cluster_name);
 	lua_setfield(L, -2, "CLUSTER_NAME");
@@ -413,6 +658,13 @@ extern int slurm_lua_job_record_field(lua_State *L, const job_record_t *job_ptr,
 		lua_pushstring(L, job_ptr->comment);
 	} else if (!xstrcmp(name, "container")) {
 		lua_pushstring(L, job_ptr->container);
+	} else if (!xstrcmp(name, "core_spec")) {
+		if (job_ptr->details &&
+		    (job_ptr->details->core_spec != NO_VAL16) &&
+		    !(job_ptr->details->core_spec & CORE_SPEC_THREAD))
+			lua_pushnumber(L, job_ptr->details->core_spec);
+		else
+			lua_pushnil(L);
 	} else if (!xstrcmp(name, "cpus_per_tres")) {
 		lua_pushstring(L, job_ptr->cpus_per_tres);
 	} else if (!xstrcmp(name, "delay_boot")) {
@@ -569,6 +821,11 @@ extern int slurm_lua_job_record_field(lua_State *L, const job_record_t *job_ptr,
 		} else
 			lua_pushnil(L);
 		FREE_NULL_BUFFER(bscript);
+	} else if (!xstrcmp(name, "segment_size")) {
+		if (job_ptr->details)
+			lua_pushnumber(L, job_ptr->details->segment_size);
+		else
+			lua_pushnumber(L, 0);
 	} else if (!xstrcmp(name, "selinux_context")) {
 		lua_pushstring(L, job_ptr->selinux_context);
  	} else if (!xstrcmp(name, "site_factor")) {
@@ -615,6 +872,14 @@ extern int slurm_lua_job_record_field(lua_State *L, const job_record_t *job_ptr,
 	} else if (!xstrcmp(name, "submit_time")) {
 		if (job_ptr->details)
 			lua_pushnumber(L, job_ptr->details->submit_time);
+		else
+			lua_pushnil(L);
+	} else if (!xstrcmp(name, "thread_spec")) {
+		if (job_ptr->details &&
+		    (job_ptr->details->core_spec != NO_VAL16) &&
+		    (job_ptr->details->core_spec & CORE_SPEC_THREAD))
+			lua_pushnumber(L, job_ptr->details->core_spec &
+						  ~CORE_SPEC_THREAD);
 		else
 			lua_pushnil(L);
 	} else if (!xstrcmp(name, "time_limit")) {
@@ -667,17 +932,6 @@ extern int slurm_lua_job_record_field(lua_State *L, const job_record_t *job_ptr,
 	return 1;
 }
 
-extern int slurm_lua_isnumber(lua_State *L, int index)
-{
-	/* lua_isnumber didn't exist before lua5.3 */
-#if LUA_VERSION_NUM == 503
-	return lua_isnumber(L, index);
-#else
-	return lua_isnumber(L, index);
-#endif
-}
-
-
 /* Generic stack dump function for debugging purposes */
 extern void slurm_lua_stack_dump(const char *plugin, char *header, lua_State *L)
 {
@@ -712,22 +966,19 @@ extern int slurm_lua_loadscript(lua_State **L, const char *plugin,
 				const char *script_path,
 				const char **req_fxns,
 				time_t *load_time,
-				void (*local_options)(lua_State *L))
+				void (*local_options)(lua_State *L),
+				char **err_msg)
 {
 	lua_State *new = NULL;
 	lua_State *curr = *L;
 	struct stat st;
 	int rc = 0;
+	char *err_str = NULL, *ret_err_str = NULL;
 
 	if (stat(script_path, &st) != 0) {
-		if (curr) {
-			error("%s: Unable to stat %s, using old script: %s",
-			      plugin, script_path, strerror(errno));
-			return SLURM_SUCCESS;
-		}
-		error("%s: Unable to stat %s: %s",
-		      plugin, script_path, strerror(errno));
-		return SLURM_ERROR;
+		err_str = xstrdup_printf("Unable to stat %s: %s",
+					 script_path, strerror(errno));
+		goto fini_error;
 	}
 
 	if (st.st_mtime <= *load_time) {
@@ -739,25 +990,16 @@ extern int slurm_lua_loadscript(lua_State **L, const char *plugin,
 
 	/* Initialize lua */
 	if (!(new = luaL_newstate())) {
-		error("%s: %s: luaL_newstate() failed to allocate.",
-		      plugin, __func__);
-		return SLURM_SUCCESS;
+		err_str = xstrdup_printf("luaL_newstate() failed to allocate");
+		goto fini_error;
 	}
 
 	luaL_openlibs(new);
 	if (luaL_loadfile(new, script_path)) {
-		if (curr) {
-			error("%s: %s: %s, using previous script",
-			      plugin, script_path,
-			      lua_tostring(new, -1));
-			lua_close(new);
-			return SLURM_SUCCESS;
-		}
-		error("%s: %s: %s", plugin, script_path,
-		      lua_tostring(new, -1));
-		lua_pop(new, 1);
+		err_str = xstrdup_printf("%s: %s",
+					 script_path, lua_tostring(new, -1));
 		lua_close(new);
-		return SLURM_ERROR;
+		goto fini_error;
 	}
 
 	/*
@@ -770,23 +1012,17 @@ extern int slurm_lua_loadscript(lua_State **L, const char *plugin,
 	else
 		lua_setglobal(new, "slurm"); /* done in local_options */
 
+	/* Register error handler globally */
+	_register_error_callback(new);
 
 	/*
 	 *  Run the user script:
 	 */
-	if (lua_pcall(new, 0, 1, 0)) {
-		if (curr) {
-			error("%s: %s: %s, using previous script",
-			      plugin, script_path,
-			      lua_tostring(new, -1));
-			lua_close(new);
-			return SLURM_SUCCESS;
-		}
-		error("%s: %s: %s", plugin, script_path,
-		      lua_tostring(new, -1));
-		lua_pop(new, 1);
+	if ((rc = slurm_lua_pcall(new, 0, 1, &ret_err_str, __func__))) {
+		err_str = xstrdup_printf("%s: %s", script_path, ret_err_str);
+		xfree(ret_err_str);
 		lua_close(new);
-		return SLURM_ERROR;
+		goto fini_error;
 	}
 
 	/*
@@ -794,17 +1030,10 @@ extern int slurm_lua_loadscript(lua_State **L, const char *plugin,
 	 */
 	rc = (int) lua_tonumber(new, -1);
 	if (rc != SLURM_SUCCESS) {
-		if (curr) {
-			error("%s: %s: returned %d on load, using previous script",
-			      plugin, script_path, rc);
-			lua_close(new);
-			return SLURM_SUCCESS;
-		}
-		error("%s: %s: returned %d on load", plugin,
-		      script_path, rc);
-		lua_pop(new, 1);
+		err_str = xstrdup_printf("%s: returned %d on load",
+					 script_path, rc);
 		lua_close(new);
-		return SLURM_ERROR;
+		goto fini_error;
 	}
 
 	/*
@@ -812,14 +1041,9 @@ extern int slurm_lua_loadscript(lua_State **L, const char *plugin,
 	 */
 	rc = _check_lua_script_functions(new, plugin, script_path, req_fxns);
 	if (rc != SLURM_SUCCESS) {
-		if (curr) {
-			error("%s: %s: required function(s) not present, using previous script",
-			      plugin, script_path);
-			lua_close(new);
-			return SLURM_SUCCESS;
-		}
-		lua_close(new);
-		return SLURM_ERROR;
+		err_str = xstrdup_printf("%s: required function(s) not present",
+					 script_path);
+		goto fini_error;
 	}
 
 	*load_time = st.st_mtime;
@@ -827,6 +1051,23 @@ extern int slurm_lua_loadscript(lua_State **L, const char *plugin,
 		lua_close(curr);
 	*L = new;
 	return SLURM_SUCCESS;
+
+fini_error:
+	if (curr) {
+		xstrfmtcat(err_str, ", using previous script");
+		rc = SLURM_SUCCESS;
+	} else {
+		rc = SLURM_ERROR;
+	}
+	error("%s: %s", plugin, err_str);
+	if (err_msg) {
+		xfree(*err_msg);
+		*err_msg = err_str;
+		err_str = NULL;
+	} else {
+		xfree(err_str);
+	}
+	return rc;
 }
 #endif
 

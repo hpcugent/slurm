@@ -48,6 +48,7 @@
 #include "src/common/fd.h"
 #include "src/common/log.h"
 #include "src/common/net.h"
+#include "src/common/proc_args.h"
 #include "src/common/read_config.h"
 #include "src/common/sack_api.h"
 #include "src/common/slurm_protocol_api.h"
@@ -71,15 +72,25 @@ static int sack_fd = -1;
 /*
  * Loosely inspired by MUNGE.
  *
- * Listen on a UNIX socket for connections. Use SO_PEERCRED to establish the
- * identify of the connecting process, and generate a credential from their
- * requested payload.
+ * Listen on a UNIX socket for connections. Use getsockopt(SO_PEERCRED) via
+ * conmgr_get_fd_auth_creds() to establish the identity of the connecting
+ * process, and generate a credential from their requested payload.
  */
 
-static void _prepare_run_dir(const char *subdir)
+static void _prepare_run_dir(const char *subdir, bool slurm_user)
 {
+	char *user;
 	int dirfd, subdirfd;
+	uint32_t uid;
 	struct stat statbuf;
+
+	if (slurm_user) {
+		uid = slurm_conf.slurm_user_id;
+		user = "SlurmUser";
+	} else {
+		uid = slurm_conf.slurmd_user_id;
+		user = "SlurmdUser";
+	}
 
 	if ((dirfd = open("/run", O_DIRECTORY | O_NOFOLLOW)) < 0)
 		fatal("%s: could not open /run", __func__);
@@ -89,10 +100,9 @@ static void _prepare_run_dir(const char *subdir)
 		/* just assume ENOENT and attempt to create */
 		if (mkdirat(dirfd, subdir, 0755) < 0)
 			fatal("%s: failed to create /run/%s", __func__, subdir);
-		if (fchownat(dirfd, subdir, slurm_conf.slurm_user_id, -1,
-			     AT_SYMLINK_NOFOLLOW) < 0)
-			fatal("%s: failed to change ownership of /run/%s to SlurmUser",
-			      __func__, subdir);
+		if (fchownat(dirfd, subdir, uid, -1, AT_SYMLINK_NOFOLLOW) < 0)
+			fatal("%s: failed to change ownership of /run/%s to %s",
+			      __func__, subdir, user);
 		close(dirfd);
 		return;
 	}
@@ -101,12 +111,12 @@ static void _prepare_run_dir(const char *subdir)
 		if (!(statbuf.st_mode & S_IFDIR))
 			fatal("%s: /run/%s exists but is not a directory",
 			      __func__, subdir);
-		if (statbuf.st_uid != slurm_conf.slurm_user_id) {
+		if (statbuf.st_uid != uid) {
 			if (statbuf.st_uid)
 				fatal("%s: /run/%s exists but is owned by %u",
 				      __func__, subdir, statbuf.st_uid);
-			warning("%s: /run/%s exists but is owned by root, not SlurmUser",
-				__func__, subdir);
+			warning("%s: /run/%s exists but is owned by %u, not %s",
+				__func__, subdir, statbuf.st_uid, user);
 		}
 	}
 
@@ -168,30 +178,43 @@ unpack_error:
 	return SLURM_ERROR;
 }
 
+static int _unpack_cred(conmgr_fd_t *con, char **token_ptr, buf_t *in)
+{
+	safe_unpackstr(token_ptr, in);
+	return SLURM_SUCCESS;
+unpack_error:
+	return SLURM_ERROR;
+}
+
 static int _sack_verify(conmgr_fd_t *con, buf_t *in)
 {
 	uid_t uid = SLURM_AUTH_NOBODY;
 	gid_t gid = SLURM_AUTH_NOBODY;
 	pid_t pid = 0;
-	uint32_t rc = SLURM_ERROR;
+	int rc = EINVAL;
 	auth_cred_t *cred = new_cred();
 
-	safe_unpackstr(&cred->token, in);
-
-	if (conmgr_get_fd_auth_creds(con, &uid, &gid, &pid)) {
-		error("%s: conmgr_get_fd_auth_creds() failed", __func__);
-		goto unpack_error;
+	if ((rc = _unpack_cred(con, &cred->token, in))) {
+		error("%s: [%s] unable to unpack token: %s",
+		      __func__, conmgr_fd_get_name(con), slurm_strerror(rc));
+	} else if ((rc = conmgr_get_fd_auth_creds(con, &uid, &gid, &pid))) {
+		error("%s: [%s] unable to verify process via kernel: %s",
+		      __func__, conmgr_fd_get_name(con), slurm_strerror(rc));
+	} else if ((rc = verify_internal(cred, uid))) {
+		debug("%s: [%s] credential verification from process uid:%u gid:%u pid:%u failed: %s",
+		      __func__, conmgr_fd_get_name(con), uid, gid, pid,
+		      slurm_strerror(rc));
+	} else {
+		uint32_t verify_rc = htonl(rc);
+		if ((rc = conmgr_queue_write_data(con, &verify_rc,
+						  sizeof(verify_rc))))
+			error("%s: [%s] reply failed: %s",
+			      __func__, conmgr_fd_get_name(con),
+			      slurm_strerror(rc));
 	}
 
-	rc = htonl(verify_internal(cred, uid));
-	conmgr_queue_write_data(con, &rc, sizeof(uint32_t));
-
 	FREE_NULL_CRED(cred);
-	return SLURM_SUCCESS;
-
-unpack_error:
-	FREE_NULL_CRED(cred);
-	return SLURM_ERROR;
+	return rc;
 }
 
 static int _on_connection_data(conmgr_fd_t *con, void *arg)
@@ -256,7 +279,6 @@ unpack_error:
 
 extern void init_sack_conmgr(void)
 {
-	conmgr_callbacks_t callbacks = {NULL, NULL};
 	static const conmgr_events_t events = {
 		.on_data = _on_connection_data,
 	};
@@ -264,7 +286,7 @@ extern void init_sack_conmgr(void)
 	const char *path = NULL;
 	const char *env_fd = NULL;
 
-	conmgr_init(0, 0, callbacks);
+	conmgr_init(0, 0, 0);
 
 	if (sack_fd >= 0) {
 		/* already have the FD -> do nothing */
@@ -272,24 +294,41 @@ extern void init_sack_conmgr(void)
 		if ((sack_fd = atoi(env_fd)) < 0)
 			fatal("%s: Invalid %s=%s environment variable",
 			      __func__, SACK_RECONFIG_ENV, env_fd);
+		unsetenv(SACK_RECONFIG_ENV);
 	} else {
+		char *runtime_dir = NULL, *runtime_socket = NULL;
 		slurm_addr_t addr = {0};
 		mode_t mask;
 
 		if (running_in_slurmctld()) {
-			_prepare_run_dir("slurmctld");
+			_prepare_run_dir("slurmctld", true);
 			path = SLURMCTLD_SACK_SOCKET;
 		} else if (running_in_slurmdbd()) {
-			_prepare_run_dir("slurmdbd");
+			_prepare_run_dir("slurmdbd", true);
 			path = SLURMDBD_SACK_SOCKET;
+		} else if (running_in_sackd() &&
+			   (runtime_dir = getenv("RUNTIME_DIRECTORY"))) {
+			if (!valid_runtime_directory(runtime_dir))
+				fatal("%s: Invalid RUNTIME_DIRECTORY=%s environment variable",
+				      __func__, runtime_dir);
+			_prepare_run_dir(runtime_dir + 5, true);
+			xstrfmtcat(runtime_socket, "%s/sack.socket",
+				   runtime_dir);
+			path = runtime_socket;
+		} else if (running_in_sackd()) {
+			_prepare_run_dir("slurm", true);
+			path = SLURM_SACK_SOCKET;
 		} else {
-			_prepare_run_dir("slurm");
+			_prepare_run_dir("slurm", false);
 			path = SLURM_SACK_SOCKET;
 		}
 
 		if ((addr = sockaddr_from_unix_path(path)).ss_family != AF_UNIX)
 			fatal("%s: Unexpected invalid socket address",
 			      __func__);
+
+		path = NULL; /* avoid reuse as it may point to runtime_socket */
+		xfree(runtime_socket);
 
 		if ((sack_fd = socket(AF_UNIX, (SOCK_STREAM | SOCK_CLOEXEC), 0))
 		     < 0)
@@ -321,13 +360,16 @@ extern void init_sack_conmgr(void)
 	 * We do not need to call conmgr_run() here since only the daemons
 	 * get here, and all the daemons call conmgr_run() separately.
 	 */
-
-	/* Prepare for reconfigure */
-	setenvfs("%s=%d", SACK_RECONFIG_ENV, sack_fd);
-	fd_set_noclose_on_exec(sack_fd);
 }
 
 extern int auth_p_get_reconfig_fd(void)
 {
+	if (sack_fd >= 0) {
+		/* Prepare for reconfigure */
+		setenvf(NULL, SACK_RECONFIG_ENV, "%d", sack_fd);
+		fd_set_noclose_on_exec(sack_fd);
+	}
+
+	/* sack_fd init'd to -1 and won't be added for skip close() later. */
 	return sack_fd;
 }

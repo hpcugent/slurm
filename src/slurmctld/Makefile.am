@@ -18,14 +18,14 @@ slurmctld_SOURCES =     \
 	crontab.c 	\
 	fed_mgr.c 	\
 	fed_mgr.h 	\
-	front_end.c	\
-	front_end.h	\
 	gang.c		\
 	gang.h		\
 	groups.c	\
 	groups.h	\
 	heartbeat.c	\
 	heartbeat.h	\
+	http.c	\
+	http.h	\
 	job_mgr.c 	\
 	job_scheduler.c	\
 	job_scheduler.h	\
@@ -65,6 +65,7 @@ slurmctld_SOURCES =     \
 	state_save.c	\
 	state_save.h	\
 	statistics.c	\
+	statistics.h	\
 	trigger_mgr.c	\
 	trigger_mgr.h
 

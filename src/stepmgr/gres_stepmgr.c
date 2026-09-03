@@ -1908,7 +1908,7 @@ static char *_build_shared_gres_details(char *nodes, int node_index,
 	return shared_gres_details_str;
 }
 
-/* Given a job's GRES data structure, return the indecies for selected elements
+/* Given a job's GRES data structure, return the indices for selected elements
  * IN job_gres_list  - job's allocated GRES data structure
  * IN nodes - list of nodes allocated to job
  * OUT gres_detail_cnt - Number of elements (nodes) in gres_detail_str
@@ -2620,18 +2620,16 @@ static int _step_alloc_type(gres_state_t *gres_state_job,
 	return 0;
 }
 
-extern int gres_stepmgr_step_alloc(
-	list_t *step_gres_list,
-	list_t **step_gres_list_alloc,
-	list_t *job_gres_list,
-	int node_offset, bool first_step_node,
-	uint16_t tasks_on_node, uint32_t rem_nodes,
-	uint32_t job_id, uint32_t step_id,
-	bool decr_job_alloc,
-	uint64_t *step_node_mem_alloc,
-	list_t *node_gres_list,
-	bitstr_t *core_bitmap,
-	int *total_gres_cpu_cnt)
+extern int gres_stepmgr_step_alloc(list_t *step_gres_list,
+				   list_t **step_gres_list_alloc,
+				   list_t *job_gres_list, int node_offset,
+				   bool first_step_node, uint16_t tasks_on_node,
+				   uint32_t rem_nodes, job_record_t *job_ptr,
+				   uint32_t step_id, bool decr_job_alloc,
+				   uint64_t *step_node_mem_alloc,
+				   list_t *node_gres_list,
+				   bitstr_t *core_bitmap,
+				   int *total_gres_cpu_cnt)
 {
 	int rc = SLURM_SUCCESS;
 	list_itr_t *step_gres_iter;
@@ -2641,8 +2639,8 @@ extern int gres_stepmgr_step_alloc(
 	if (step_gres_list == NULL)
 		return SLURM_SUCCESS;
 	if (job_gres_list == NULL) {
-		error("%s: step allocates GRES, but job %u has none",
-		      __func__, job_id);
+		error("%s: step allocates GRES, but %pJ has none",
+		      __func__, job_ptr);
 		return ESLURM_INSUFFICIENT_GRES;
 	}
 
@@ -2652,8 +2650,7 @@ extern int gres_stepmgr_step_alloc(
 	xassert(step_node_mem_alloc);
 	*step_node_mem_alloc = 0;
 
-	tmp_step_id.job_id = job_id;
-	tmp_step_id.step_het_comp = NO_VAL;
+	tmp_step_id = STEP_ID_FROM_JOB_RECORD(job_ptr);
 	tmp_step_id.step_id = step_id;
 
 	step_gres_iter = list_iterator_create(step_gres_list);
@@ -2796,15 +2793,15 @@ static int _step_dealloc(gres_state_t *gres_state_step, list_t *job_gres_list,
 	    (gres_ss->gres_bit_alloc[node_offset] == NULL))
 		return SLURM_SUCCESS;
 	if (gres_js->gres_bit_alloc[node_offset] == NULL) {
-		error("gres/%s: %s job %u gres_bit_alloc[%d] is NULL",
-		      gres_state_job->gres_name, __func__,
-		      step_id->job_id, node_offset);
+		error("gres/%s: %s %pI gres_bit_alloc[%d] is NULL",
+		      gres_state_job->gres_name, __func__, &step_id,
+		      node_offset);
 		return SLURM_SUCCESS;
 	}
 	len_j = bit_size(gres_js->gres_bit_alloc[node_offset]);
 	len_s = bit_size(gres_ss->gres_bit_alloc[node_offset]);
 	if (len_j != len_s) {
-		error("gres/%s: %s %ps dealloc, bit_alloc[%d] size mis-match (%d != %d)",
+		error("gres/%s: %s %ps dealloc, bit_alloc[%d] size mismatch (%d != %d)",
 		      gres_state_job->gres_name, __func__,
 		      step_id, node_offset, len_j, len_s);
 		len_j = MIN(len_j, len_s);
@@ -3026,7 +3023,7 @@ static void _gres_2_tres_str_internal(char **tres_str,
 /*
  * Given a job's GRES data structure, return a simple tres string of gres
  * allocated on the node_inx requested
- * IN job_gres_list  - job's alllocated GRES data structure
+ * IN job_gres_list  - job's allocated GRES data structure
  * IN node_inx - position of node in gres_js->gres_cnt_node_alloc
  * IN locked - if the assoc_mgr tres read locked is locked or not
  *
@@ -3111,9 +3108,12 @@ static uint64_t _step_test(gres_step_state_t *gres_ss, bool first_step_node,
 	    (gres_ss->gres_per_step > gres_ss->total_gres) &&
 	    (max_rem_nodes == 1)) {
 		uint64_t gres_per_step = gres_ss->gres_per_step;
-		if (ignore_alloc)
-			gres_per_step -= gres_ss->gross_gres;
-		else
+		if (ignore_alloc) {
+			if (gres_ss->gross_gres > gres_per_step)
+				gres_per_step = 0;
+			else
+				gres_per_step -= gres_ss->gross_gres;
+		} else
 			gres_per_step -= gres_ss->total_gres;
 		min_gres = MAX(min_gres, gres_per_step);
 	}
@@ -3148,9 +3148,8 @@ static uint64_t _step_test(gres_step_state_t *gres_ss, bool first_step_node,
 			mem_avail -= job_resrcs_ptr->memory_used[node_offset];
 
 		if (mem_avail < mem_req) {
-			log_flag(STEPS, "%s: JobId=%u: Usable memory on node: %"PRIu64" is less than requested %"PRIu64", skipping the node",
-				 __func__, step_id->job_id, mem_avail,
-				 mem_req);
+			log_flag(STEPS, "%s: %pI: Usable memory on node: %"PRIu64" is less than requested %"PRIu64", skipping the node",
+				 __func__, &step_id, mem_avail, mem_req);
 			cpu_cnt = 0;
 			*err_code = ESLURM_INVALID_TASK_MEMORY;
 		}
@@ -3425,10 +3424,10 @@ extern void gres_stepmgr_step_test_per_step(
 {
 	list_itr_t *step_gres_iter;
 	gres_state_t *gres_state_step;
-	slurm_step_id_t tmp_step_id;
 	foreach_gres_cnt_t foreach_gres_cnt;
 	bitstr_t *node_bitmap = job_ptr->job_resrcs->node_bitmap;
 	int i_first, bit_len;
+	slurm_step_id_t tmp_step_id = STEP_ID_FROM_JOB_RECORD(job_ptr);
 
 	if (!step_gres_list)
 		return;
@@ -3440,10 +3439,6 @@ extern void gres_stepmgr_step_test_per_step(
 	bit_len = bit_fls(node_bitmap) + 1;
 	if (i_first >= bit_len)
 		i_first = 0;
-
-	tmp_step_id.job_id = job_ptr->job_id;
-	tmp_step_id.step_het_comp = NO_VAL;
-	tmp_step_id.step_id = NO_VAL;
 
 	memset(&foreach_gres_cnt, 0, sizeof(foreach_gres_cnt));
 	foreach_gres_cnt.ignore_alloc = false;
@@ -3461,7 +3456,7 @@ extern void gres_stepmgr_step_test_per_step(
 			continue;
 
 		gres_req = gres_ss->gres_per_step;
-		limit = (gres_req + min_nodes - 1) / min_nodes;
+		limit = ROUNDUP(gres_req, min_nodes);
 
 		job_search_key.config_flags = gres_state_step->config_flags;
 		job_search_key.plugin_id = gres_state_step->plugin_id;

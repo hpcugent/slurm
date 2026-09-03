@@ -94,21 +94,16 @@ static pthread_mutex_t  file_lock = PTHREAD_MUTEX_INITIALIZER;
 static char *           log_name  = NULL;
 static int              job_comp_fd = -1;
 
-/*
- * init() is called when the plugin is loaded, before any other functions
- * are called.  Put global initialization here.
- */
-int init ( void )
+extern int init(void)
 {
 	return SLURM_SUCCESS;
 }
 
-int fini ( void )
+extern void fini(void)
 {
 	if (job_comp_fd >= 0)
 		close(job_comp_fd);
 	xfree(log_name);
-	return SLURM_SUCCESS;
 }
 
 /*
@@ -154,12 +149,12 @@ static void _make_time_str (time_t *time, char *string, int size)
 	}
 }
 
-extern int jobcomp_p_log_record(job_record_t *job_ptr)
+extern int jobcomp_p_record_job_end(job_record_t *job_ptr, uint32_t event)
 {
 	int rc = SLURM_SUCCESS, tmp_int, tmp_int2;
 	char *job_rec = NULL;
 	char start_str[32], end_str[32], lim_str[32];
-	char *usr_str = NULL, *grp_str = NULL;
+	char *usr_str = NULL, *grp_str = NULL, *partition = NULL;
 	char *resv_name, *tres, *account, *qos, *wckey, *cluster;
 	char *exit_code_str = NULL, *derived_ec_str = NULL;
 	char submit_time[32], eligible_time[32], array_id[64], het_id[64];
@@ -176,6 +171,8 @@ extern int jobcomp_p_log_record(job_record_t *job_ptr)
 	slurm_mutex_lock( &file_lock );
 	usr_str = user_from_job(job_ptr);
 	grp_str = group_from_job(job_ptr);
+	partition = job_ptr->part_ptr ? job_ptr->part_ptr->name :
+					job_ptr->partition;
 
 	if ((job_ptr->time_limit == NO_VAL) && job_ptr->part_ptr)
 		time_limit = job_ptr->part_ptr->max_time;
@@ -306,11 +303,11 @@ extern int jobcomp_p_log_record(job_record_t *job_ptr)
 		   (unsigned long) job_ptr->job_id, usr_str,
 		   (unsigned long) job_ptr->user_id, grp_str,
 		   (unsigned long) job_ptr->group_id, job_ptr->name,
-		   state_string, job_ptr->partition, lim_str, start_str,
-		   end_str, job_ptr->nodes, job_ptr->node_cnt,
-		   job_ptr->total_cpus, work_dir, resv_name, tres, account, qos,
-		   wckey, cluster, submit_time, eligible_time, array_id, het_id,
-		   derived_ec_str, exit_code_str);
+		   state_string, partition, lim_str, start_str, end_str,
+		   job_ptr->nodes, job_ptr->node_cnt, job_ptr->total_cpus,
+		   work_dir, resv_name, tres, account, qos, wckey, cluster,
+		   submit_time, eligible_time, array_id, het_id, derived_ec_str,
+		   exit_code_str);
 	tot_size = strlen(job_rec);
 
 	while (offset < tot_size) {
@@ -343,4 +340,9 @@ extern int jobcomp_p_log_record(job_record_t *job_ptr)
 extern list_t *jobcomp_p_get_jobs(slurmdb_job_cond_t *job_cond)
 {
 	return filetxt_jobcomp_process_get_jobs(job_cond);
+}
+
+extern int jobcomp_p_record_job_start(job_record_t *job_ptr, uint32_t event)
+{
+	return SLURM_SUCCESS;
 }
